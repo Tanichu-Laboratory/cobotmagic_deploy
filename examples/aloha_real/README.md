@@ -1,6 +1,6 @@
 # Run Aloha (Real Robot)
 
-This example demonstrates how to run with a real robot using an [ALOHA setup](https://github.com/tonyzhaozh/aloha). See [here](../../docs/remote_inference.md) for instructions on how to load checkpoints and run inference. We list the relevant checkpoint paths for each provided fine-tuned model below.
+This example demonstrates how to run with a real robot using an [ALOHA setup](https://github.com/tonyzhaozh/aloha). See [OpenPI remote inference documentation](https://github.com/Physical-Intelligence/openpi/blob/main/docs/remote_inference.md) for instructions on how to load checkpoints and run inference. We list the relevant checkpoint paths for each provided fine-tuned model below.
 
 ## Prerequisites
 
@@ -8,13 +8,6 @@ This repo uses a fork of the ALOHA repo, with very minor modifications to use Re
 
 1. Follow the [hardware installation instructions](https://github.com/tonyzhaozh/aloha?tab=readme-ov-file#hardware-installation) in the ALOHA repo.
 1. Modify the `third_party/aloha/aloha_scripts/realsense_publisher.py` file to use serial numbers for your cameras.
-
-## With Docker
-
-```bash
-export SERVER_ARGS="--env ALOHA --default_prompt='take the toast out of the toaster'"
-docker compose -f examples/aloha_real/compose.yml up --build
-```
 
 ## Without Docker
 
@@ -40,7 +33,7 @@ roslaunch aloha ros_nodes.launch
 Terminal window 3:
 
 ```bash
-uv run scripts/serve_policy.py --env ALOHA --default_prompt='take the toast out of the toaster'
+cd /workspace/project/openpi && uv run scripts/serve_policy.py --env ALOHA --default_prompt='take the toast out of the toaster'
 ```
 
 ## **ALOHA Checkpoint Guide**
@@ -121,6 +114,6 @@ This task involves opening a tupperware filled with food and pouring the content
 
 2. Define a training config that uses the custom dataset.
 
-    We provide the [pi0_aloha_pen_uncap config](../../src/openpi/training/config.py) as an example. You should refer to the root [README](../../README.md) for how to run training with the new config.
+    We provide the [pi0_aloha_pen_uncap config](https://github.com/Physical-Intelligence/openpi/blob/main/src/openpi/training/config.py) as an example. You should refer to the root [README](../../README.md) for how to run training with the new config.
 
 IMPORTANT: Our base checkpoint includes normalization stats from various common robot configurations. When fine-tuning a base checkpoint with a custom dataset from one of these configurations, we recommend using the corresponding normalization stats provided in the base checkpoint. In the example, this is done by specifying the trossen asset_id and a path to the pretrained checkpoint’s asset directory within the AssetsConfig.

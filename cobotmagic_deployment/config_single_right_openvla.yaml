@@ -1,0 +1,84 @@
+# ====== right-arm-only OpenVLA-OFT deployment ======
+policy_backend: "openvla_single_right"
+
+openvla:
+  # Right-arm-only SFT LoRA run. These paths use the run root artifacts.
+  base_checkpoint: "/workspace/project/openvla-oft/checkpoints/checkpoint_files/SFT_models/stack_three"
+  adapter_dir: "/workspace/project/openvla-oft/runs/stach_three_one_single_arm_l1_delta_2cam_plus1k_gpu1_2_ddp/lora_adapter"
+  processor_dir: "/workspace/project/openvla-oft/runs/stach_three_one_single_arm_l1_delta_2cam_plus1k_gpu1_2_ddp"
+  dataset_statistics: "/workspace/project/openvla-oft/runs/stach_three_one_single_arm_l1_delta_2cam_plus1k_gpu1_2_ddp/dataset_statistics.json"
+  proprio_projector: "/workspace/project/openvla-oft/runs/stach_three_one_single_arm_l1_delta_2cam_plus1k_gpu1_2_ddp/proprio_projector--smoke.pt"
+  action_head: "/workspace/project/openvla-oft/runs/stach_three_one_single_arm_l1_delta_2cam_plus1k_gpu1_2_ddp/action_head--smoke.pt"
+  use_l1_regression: true
+  unnorm_key: "stach_three_one_lerobot_action_clean"
+  num_images_in_input: 2
+  center_crop: true
+  merge_lora: true
+  action_delta_scale: 1.0
+  action_delta_scale_per_dim:
+  device: "cuda:0"
+  warmup: true
+  warmup_image_hw: [480, 640]
+
+task_prompt: "stack the three cubes"
+
+ros:
+  image_type: "raw"
+  jpeg_quality: 80
+  rate_hz: 5
+  policy_response_timeout_sec: 5.0
+  max_joint_age_sec: 0.75
+  max_image_age_sec: 2.0
+  # joint_delta targets are reliable for the first action because they are
+  # defined against the current state. Future chunk steps can act like repeated
+  # velocity commands and caused R2 to drift negative, so deploy only idx0.
+  open_loop_steps: 1
+
+  # Use measured state by default. Switch to "commanded" only if measured gripper
+  # lag is confirmed to confuse the policy.
+  policy_gripper_input:
+    mode: "measured"   # measured, commanded, or hybrid
+    hybrid_max_error: 0.025
+
+  joint_delta_reconstruction:
+    # The single-arm SFT dataset trains joint_delta as action[t] - state[t].
+    # For action_index > 0, reconstruct absolute targets from the live joint
+    # state at publish time instead of the state captured at policy request time.
+    enabled: true
+
+  gripper_threshold:
+    enabled: true
+    # These are absolute right gripper targets after joint_delta is added back
+    # to the measured 7D state.
+    close_threshold: 0.020
+    open_threshold: 0.0425
+    close_value: -0.0033
+    open_value: 0.059
+
+  action_log:
+    enabled: true
+    dir: "logs/action_commands"
+    flush_every_rows: 1
+
+  topics:
+    img_front: "/camera_f/color/image_raw"
+    img_right: "/camera_r/color/image_raw"
+    puppet_arm_right: "/puppet/joint_right"
+    cmd_joint_right: "/master/joint_right"
+    enable_flag: "/enable_flag"
+  publish_enable_flag: true
+
+  home_position:
+    enabled: true
+    mode: "linear"
+    rate_hz: 200
+    num_steps: 200
+    wait_timeout_sec: 10.0
+    # Frame-0 mean over 49 episodes in:
+    # /workspace/project/gr00t_datasets/stach_three_one_lerobot
+    right: [0.29190113197784034, 0.6351278533740919, -0.514559550552952, 0.05553778032867276, 0.6563244516752205, -0.26894091305379964, -0.0013877550990567828]
+
+zmq:
+  socket_type: "req"
+  server_bind: "tcp://127.0.0.1:5556"
+  client_connect: "tcp://127.0.0.1:5556"

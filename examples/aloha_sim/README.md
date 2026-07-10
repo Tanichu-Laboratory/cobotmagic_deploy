@@ -1,12 +1,5 @@
 # Run Aloha Sim
 
-## With Docker
-
-```bash
-export SERVER_ARGS="--env ALOHA_SIM"
-docker compose -f examples/aloha_sim/compose.yml up --build
-```
-
 ## Without Docker
 
 Terminal window 1:
@@ -32,5 +25,5 @@ Terminal window 2:
 
 ```bash
 # Run the server
-uv run scripts/serve_policy.py --env ALOHA_SIM
+cd /workspace/project/openpi && uv run scripts/serve_policy.py --env ALOHA_SIM
 ```

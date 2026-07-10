@@ -1,173 +1,141 @@
-# pi0 for CobotMagic
+# CobotMagic Multi-Policy Deployment
 
-## Introduction
+CobotMagicで複数のVLAバックエンドを動かすためのROS・ZeroMQブリッジです。
+モデル本体や学習コードはこのリポジトリに含めず、`/workspace/project` 配下の各モデルリポジトリを利用します。
 
-このドキュメントは、CobotMagic で `pi0` / `pi05` を動かす方法と、ファインチューニング手順をまとめたものです。
+## 対応バックエンド
 
-- 現在、デプロイ可能な GPU サーバーは `ginkaku, inari`です。
-- CobotMagic 向けのメイン実装は `cobotmagic/` 配下に集約しています。
+| バックエンド | 設定 | ROSブリッジ | ポリシーサーバー |
+| --- | --- | --- | --- |
+| OpenPI π₀ / π₀.₅ | `config_openpi.yaml` | `ros_bridge_node.py` | `policy_server_openpi.py` |
+| OpenVLA FiLM | `config_openvla_stack_three_film_absolute_stage2.yaml` | `ros_bridge_node.py` | OpenVLA-OFT側サーバー |
+| SemanticVLA | `config_semanticvla_stack_three_bs8_3k.yaml` | `ros_bridge_node.py` | OpenVLA-OFT側サーバー |
+| OpenVLA右単腕 | `config_single_right_openvla.yaml` | `ros_bridge_node_single_right.py` | OpenVLA-OFT側サーバー |
+| X-VLA | `config_xvla_agilex.yaml` | `ros_bridge_node.py` | `policy_server_xvla_agilex.py` |
+| Hy-VLA EEF | `config_hy_vla_eef.yaml` | `ros_bridge_node.py` | `policy_server_xvla_agilex.py` |
+| DreamZero | `config_dreamzero_agilex.yaml` | `ros_bridge_node.py` | `policy_server_dreamzero_agilex.py` |
 
-## Preparation
+実装は `cobotmagic_deployment/`、カメラ専用ブリッジは `realsense_bridge/` にあります。
 
-### 1. ginkaku で Docker コンテナを作成
+## セットアップ
 
-`[container_name]` と `[your_mount_dir]` は環境に合わせて置き換えてください。
+### ROS環境
 
 ```bash
-docker run -it --gpus all \
-  --name [container_name] \
-  --network host \
-  --shm-size=32g \
-  -v [your_mount_dir]:/workspace \
-  pi0_bridge_env
+conda env create -n aloha -f aloha.yml
+conda activate aloha
 ```
 
-### 注意
+ROS masterのアドレスは環境に合わせて設定します。
 
-`ginkaku` の IP アドレスをコンテナ側に割り当てるため、コンテナは `root` で起動します。  
-`root` で同時起動できるコンテナは 1 つのみのため、競合時はエラーになります。
-
-### 2. githubからこのリポジトリをクローン
 ```bash
-git clone --recurse-submodules \
-https://github.com/Tanichu-Laboratory/pi0_CobotMagic.git
-```
-### 3. 仮想環境のセットアップ
-ROS-Noetic用のconda環境 \
-※conda自体のセットアップはこちらを参照してください：https://developers.google.com/earth-engine/guides/python_install-conda?hl=ja
-```bash
-conda env create -n aloha -f <THIS REP>/aloha.yml
-```
-pi0用のuv環境
-```bash
-pip install uv #if needed
-cd <THID REP>
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+export ROS_MASTER_URI=http://<cobotmagic-ip>:11311
+export ROS_IP=<gpu-server-ip>
 ```
 
+### モデル環境
 
-### 4. ROSのURI設定ファイルを作成する
-```bash
-cat > ~/.setup_ros.sh <<'EOF'
-# > export ROS_MASTER_URI=http://10.228.162.34:11311
-# > export ROS_IP=10.228.162.222
-# > EOF
-```
-### 注意
+各ポリシーサーバーは、それぞれのモデルリポジトリの環境で起動します。
 
-ROS_MASTER_URIはCobotMagicのIPアドレスなので、使用時に変わっている可能性があります。その都度変更してください。
+- OpenPI: `/workspace/project/openpi`
+- OpenVLA-OFT: `/workspace/project/openvla-oft`
+- X-VLA: `/workspace/project/X-VLA`
+- Hy-VLA: `/workspace/project/Hy-Embodied-0.5-VLA`
+- DreamZero: `/workspace/project/dreamzero`
 
-## Deployment pi0 on CobotMagic
+チェックポイントや外部リポジトリの場所を変える場合は、対応するYAMLを更新してください。
 
-### 1. CobotMagic 側
-
-ROS を起動して、必要なノードを立ち上げます。
+## CobotMagic側
 
 ```bash
 roscore
-cd cobot_magic/Piper_ros_private-ros-noetic/
+cd /workspace/ros_cobotmagic/Piper_ros_private-ros-noetic
 bash can_config.sh
-# >>> agx
 roslaunch piper start_ms_piper.launch mode:=1 auto_enable:=true
 roslaunch astra_camera multi_camera.launch
-
-# D405 を使う場合
-roslaunch realsense2_camera rs_camera.launch camera:=camera_r serial_id:=218622277086
-roslaunch realsense2_camera rs_camera.launch camera:=camera_l serial_id:=218622277131
 ```
 
-### 2. GPU サーバー（ginkaku）側
+D405を使う場合は、機体のserial IDに合わせてRealSenseノードを起動します。
 
+## 起動方法
 
-トピックが見えていることを確認します。
+以下のコマンドはcloneしたリポジトリのルートから実行します。
+ROSブリッジとポリシーサーバーは別ターミナルで起動してください。
+
+### OpenPI
 
 ```bash
-rostopic list
+# ROS環境
+python cobotmagic_deployment/ros_bridge_node.py \
+  --config cobotmagic_deployment/config_openpi.yaml
+
+# OpenPI環境
+source /workspace/project/openpi/.venv/bin/activate
+OPENPI_REPO_PATH=/workspace/project/openpi \
+python cobotmagic_deployment/policy_server_openpi.py \
+  --config cobotmagic_deployment/config_openpi.yaml
 ```
 
-`puppet_right`, `puppet_left` などが表示されれば OK です。  
-タスクプロンプトは `cobotmagic/config.yaml` の先頭で指定します。
+OpenPIの学習・正規化統計・データ変換は外部リポジトリで行います。
+詳細は `/workspace/project/openpi/docs/local_mobile_finetune.md` を参照してください。
 
-ターミナルを 2 つ用意して実行します。
-
-#### ターミナル1（Python 3.8 / conda）
+### X-VLA
 
 ```bash
-conda activate aloha
-python cobotmagic/ros_bridge_node.py --config cobotmagic/config.yaml
+python cobotmagic_deployment/ros_bridge_node.py \
+  --config cobotmagic_deployment/config_xvla_agilex.yaml
+python cobotmagic_deployment/policy_server_xvla_agilex.py \
+  --config cobotmagic_deployment/config_xvla_agilex.yaml
 ```
 
-#### ターミナル2（Python 3.11 / uv）
+### Hy-VLA EEF
 
 ```bash
-cd /workspace/project/openpi
-source .venv/bin/activate
-uv run python cobotmagic/policy_server.py --config cobotmagic/config.yaml
+python cobotmagic_deployment/ros_bridge_node.py \
+  --config cobotmagic_deployment/config_hy_vla_eef.yaml
+python cobotmagic_deployment/policy_server_xvla_agilex.py \
+  --config cobotmagic_deployment/config_hy_vla_eef.yaml
 ```
 
-初期姿勢への移動が終わった後、任意キー入力で推論開始します。
-
-## Fine-Tuning
-
-### 1. 変換前データの確認
-以下のように`data/dir/episode_*.hdf5` を配置します。
-```text
-/workspace/project
-├── openpi/                         # このREADMEの作業ディレクトリ
-│   └── scripts/
-│       └── convert_local_mobile_aloha_to_lerobot.py
-├── data/                           # 変換前データ（--data-root）
-│   ├── <dir1>/episode_*.hdf5
-│   └── <dir2>/episode_*.hdf5
-└── buffer/                         # 変換後データ保存先（HF_LEROBOT_HOME）
-    └── <repo-id>/                  # 例: mobile_aloha_test
-```
-
-### 2. uv 環境を有効化
+### DreamZero
 
 ```bash
-cd /workspace/project/openpi
-source .venv/bin/activate
+python cobotmagic_deployment/ros_bridge_node.py \
+  --config cobotmagic_deployment/config_dreamzero_agilex.yaml
+python cobotmagic_deployment/policy_server_dreamzero_agilex.py \
+  --config cobotmagic_deployment/config_dreamzero_agilex.yaml
 ```
 
-### 3. データ変換（LeRobot 形式）
+複数GPUでDreamZeroを使う場合は、環境に合わせて `torchrun` を使用します。
+
+### OpenVLA右単腕
 
 ```bash
-HF_LEROBOT_HOME=/workspace/project/buffer \
-uv run python scripts/convert_local_mobile_aloha_to_lerobot.py \
-  --data-root /workspace/project/data \
-  --repo-id mobile_aloha_test
+python cobotmagic_deployment/ros_bridge_node_single_right.py \
+  --config cobotmagic_deployment/config_single_right_openvla.yaml
 ```
 
-出力先: `/workspace/project/buffer/mobile_aloha_test`  
-### 重要
-タスクプロンプトは、変換時に`data/`に対して辞書を用いて割り振られます
-`scripts/convert_local_mobile_aloha_to_lerobot.py`の冒頭でその辞書を定義する箇所があるので、使用するデータに合わせて変更してください。
+OpenVLA-OFT側のポリシーサーバーは外部モデルリポジトリから起動してください。
 
-### 4. 正規化統計を作成
+## 動作確認
+
+EEFの微小動作確認には次を使用できます。実機の安全を確保して実行してください。
 
 ```bash
-HF_LEROBOT_HOME=/workspace/project/buffer \
-uv run python scripts/compute_norm_stats.py --config-name pi0_mobile_aloha_local
+python cobotmagic_deployment/eef_motion_smoke_test.py --help
 ```
 
-出力先: `assets/pi0_mobile_aloha_local/<asset_id>`  
-`asset_id` は設定値に合わせてください。
-
-### 5. 学習開始
+モデルをロードせずX-VLAサーバーのプロトコルだけを確認する場合:
 
 ```bash
-HF_LEROBOT_HOME=/workspace/project/buffer \
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
-uv run python scripts/train.py pi0_mobile_aloha_local \
-  --data.repo-id mobile_aloha_test \
-  --exp-name mobile_aloha_lora \
-  --overwrite
+python cobotmagic_deployment/policy_server_xvla_agilex.py \
+  --config cobotmagic_deployment/config_xvla_agilex.yaml \
+  --mock --startup-test
 ```
 
-## Notes
+## 注意
 
-- `repo-id` は `HF_LEROBOT_HOME` 配下のサブディレクトリ名として指定します。
-- 変換・学習・norm stats の 3 ステップで同じ `repo-id` を使うことが重要です。
-- `pi0_mobile_aloha_local` / `pi05_mobile_aloha_local` は LoRA 設定済みです。
+- `policy_server_protocol.py` はX-VLA/Hy-VLA/DreamZero共通の通信実装で、直接起動しません。
+- ROS用Python環境とモデル用Python環境は分離してください。
+- YAML内の絶対パス、GPU番号、ROS topic、初期姿勢は実行環境に合わせて確認してください。
+- ログは既定でリポジトリ内の `logs/action_commands` に保存されます。

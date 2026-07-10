@@ -1,0 +1,200 @@
+# CobotMagic bridge config for Hy-VLA EEF inference.
+policy_backend: hy_vla
+task_prompt: pick up the black cube and place it in the green box
+ros:
+  image_type: raw
+  jpeg_quality: 80
+  rate_hz: 5
+  policy_response_timeout_sec: 5.0
+  max_joint_age_sec: 0.75
+  max_image_age_sec: 2.0
+  action_mode: eef_absolute
+  initial_action_skip_steps: 0
+  chunk_action_skip_steps: 0
+  open_loop_steps: 1
+  policy_request:
+    when_live_chunk: wait
+  chunk_interpolation:
+    enabled: false
+    mode: adaptive_delta
+    source_steps_to_execute: 4
+    source_overlap_steps: 12
+    min_factor: 1
+    max_factor: 3
+    initial_bridge_enabled: false
+    initial_bridge_max_factor: 4
+    joint_threshold:
+    - 0.03
+    - 0.086
+    - 0.088
+    - 0.049
+    - 0.058
+    - 0.058
+    - 0.0043
+  delta_clip:
+    enabled: false
+    reference: current
+    max_delta:
+    - 0.006
+    - 0.012
+    - 0.012
+    - 0.01
+    - 0.01
+    - 0.01
+    - 1000.0
+  command_delta_deadband:
+    enabled: false
+    left:
+    - 0.00025
+    - 0.0005
+    - 0.001
+    - 0.00075
+    - 0.001
+    - 0.00075
+    - 0.0
+    right:
+    - 0.0005
+    - 0.0005
+    - 0.0015
+    - 0.001
+    - 0.0015
+    - 0.001
+    - 0.0
+  gripper_threshold:
+    enabled: false
+    close_threshold:
+    - 0.35
+    - 0.35
+    open_threshold:
+    - 0.5
+    - 0.5
+    close_value:
+    - -0.0037
+    - -0.0033
+    open_value:
+    - 0.058
+    - 0.059
+  policy_gripper_input:
+    mode: commanded
+    hybrid_max_error: 0.025
+  command_publish:
+    mode: direct
+    rate_hz: 5
+    interpolation: linear
+  eef_ik:
+    enabled: true
+    urdf_path: /workspace/project/X-VLA/evaluation/SoftFold-Agilex/Piper_ros_private-ros-noetic/src/piper_description/urdf/piper_description.urdf
+    base_link: base_link
+    tip_link: link6
+    max_iters: 80
+    tolerance: 0.0001
+    damping: 0.03
+    max_step_rad: 0.18
+    position_weight: 1.0
+    orientation_weight: 0.25
+    max_position_error_m: 0.04
+    max_orientation_error_rad: 0.8
+    joint_regularization_weight: 0.08
+    max_joint_delta_rad: [0.12, 0.12, 0.12, 0.16, 0.16, 0.16]
+    clip_to_max_joint_delta: true
+    publish_on_failure: false
+  action_filter:
+    enabled: false
+    ema_alpha: 1.0
+    deadband:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+  temporal_ensemble:
+    enabled: false
+    exp_decay: 0.4
+    max_history_chunks: 4
+    max_candidate_age: 3
+    min_action_index: 0
+    overlap_steps: 12
+    latency_compensation:
+      enabled: false
+      mode: measured
+      max_steps: 1
+  action_log:
+    enabled: true
+    dir: logs/action_commands
+    flush_every_rows: 1
+    rich:
+      enabled: true
+      save_request_images: true
+      save_action_chunks: true
+      request_snapshot_every_n: 1
+  rollout_dataset:
+    enabled: false
+    dir: /workspace/project/cobotmagic_datasets
+    format: hdf5
+    save_images: true
+  topics:
+    img_front: /camera_f/color/image_raw
+    img_left: /camera_l/color/image_raw
+    img_right: /camera_r/color/image_raw
+    puppet_arm_left: /puppet/joint_left
+    puppet_arm_right: /puppet/joint_right
+    cmd_joint_left: /master/joint_left
+    cmd_joint_right: /master/joint_right
+    puppet_arm_left_pose: /puppet/end_pose_left
+    puppet_arm_right_pose: /puppet/end_pose_right
+    control_arm_left_pose: /control/end_pose_left
+    control_arm_right_pose: /control/end_pose_right
+    enable_flag: /enable_flag
+  publish_enable_flag: true
+  use_robot_base: false
+  robot_base_topics:
+    odom: /odom_raw
+    cmd_vel: /cmd_vel
+  clip:
+    v_max: 0.2
+    w_max: 0.6
+  home_position:
+    mode: linear
+    rate_hz: 200
+    num_steps: 200
+    settle: true
+    settle_tolerance: 0.04
+    settle_hold_sec: 0.5
+    settle_timeout_sec: 8.0
+    settle_rate_hz: 50
+    left:
+    - -0.0010295446263626218
+    - 0.30587080121040344
+    - -0.393717885017395
+    - 0.005400840658694506
+    - 0.5136011838912964
+    - 0.08619414269924164
+    - -0.003028000006452203
+    right:
+    - 0.07645199447870255
+    - 0.3571706712245941
+    - -0.38943028450012207
+    - -0.07059866189956665
+    - 0.5584428906440735
+    - 0.015449974685907364
+    - -0.0025159993674606085
+zmq:
+  socket_type: req
+  server_bind: tcp://127.0.0.1:5555
+  client_connect: tcp://127.0.0.1:5555
+hy_vla:
+  ckpt_path: /workspace/project/Hy-Embodied-0.5-VLA/outputs/vifailback_aloha_success_ft/train_umi_h50_60k_fixedsave_20260704_0047/final
+  norm_path: /workspace/project/Hy-Embodied-0.5-VLA/outputs/vifailback_aloha_success_ft/train_umi_h50_60k_fixedsave_20260704_0047/norm_stats.pkl
+  repo_path: /workspace/project/Hy-Embodied-0.5-VLA
+  torch_dtype: bfloat16
+  warmup: true
+  warmup_image_hw:
+  - 480
+  - 640
+  blend_mode: rel_only
+  exc_action_size: 50
+  img_history_size: 6
+  img_history_interval: 1
+  max_state_dim: 32
