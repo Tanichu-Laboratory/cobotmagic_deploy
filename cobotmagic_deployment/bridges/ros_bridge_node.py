@@ -22,6 +22,8 @@ import cv2
 import numpy as np
 import yaml
 import zmq
+from scipy.interpolate import CubicSpline
+from scipy.signal import savgol_filter
 
 import rospy
 from cv_bridge import CvBridge
@@ -633,6 +635,40 @@ def threshold_gripper_targets(target_left, target_right, close_thresholds, open_
     elif out_right[-1] <= close_thresholds[1]:
         out_right[-1] = close_values[1]
     return out_left, out_right
+
+
+def smooth_action_chunk_savgol(mat, upsample_factor=2, window_length=21, polyorder=3):
+    """Apply the DreamZero paper's cubic-upsample/Savitzky-Golay smoothing."""
+    mat = np.asarray(mat, dtype=np.float32)
+    if mat.ndim != 2 or mat.shape[0] < 2:
+        return mat.copy()
+
+    upsample_factor = max(int(upsample_factor), 1)
+    polyorder = max(int(polyorder), 0)
+    source_time = np.arange(mat.shape[0], dtype=np.float64)
+    upsampled_time = np.linspace(
+        0.0,
+        float(mat.shape[0] - 1),
+        mat.shape[0] * upsample_factor,
+        dtype=np.float64,
+    )
+    upsampled = CubicSpline(source_time, mat, axis=0)(upsampled_time)
+
+    max_window = upsampled.shape[0] if upsampled.shape[0] % 2 == 1 else upsampled.shape[0] - 1
+    window_length = min(max(int(window_length), polyorder + 2), max_window)
+    if window_length % 2 == 0:
+        window_length -= 1
+    if window_length <= polyorder:
+        return mat.copy()
+
+    smoothed = savgol_filter(
+        upsampled,
+        window_length=window_length,
+        polyorder=polyorder,
+        axis=0,
+        mode='interp',
+    )
+    return CubicSpline(upsampled_time, smoothed, axis=0)(source_time).astype(np.float32)
 
 
 def linear_upsample_chunk(mat, factor):

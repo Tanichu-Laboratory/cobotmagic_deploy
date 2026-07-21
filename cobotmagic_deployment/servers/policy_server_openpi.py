@@ -29,7 +29,7 @@ import torch
 import yaml
 import zmq
 
-from policy_openpi import Pi0Policy
+from cobotmagic_deployment.policies.policy_openpi import Pi0Policy
 
 
 def decode_jpeg(buf: bytes):

@@ -24,7 +24,7 @@ import torch.distributed as dist
 import yaml
 from tianshou.data import Batch
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
+from cobotmagic_deployment.common.policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
 
 
 DREAMZERO_REPO = Path("/workspace/project/dreamzero")
@@ -56,6 +56,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 def setup_dreamzero_flash(enabled: bool, num_dit_steps: int) -> None:
+    os.environ.setdefault("DREAMZERO_FAST_LOAD", "1")
     os.environ.setdefault("ATTENTION_BACKEND", "TE")
     os.environ["ENABLE_DIT_CACHE"] = "true" if enabled else "false"
     if enabled:
@@ -140,16 +141,21 @@ def _stack_single_frame(img: np.ndarray) -> np.ndarray:
     return img[None, ...]
 
 
-def make_observation(header: dict[str, Any], imgs: dict[str, np.ndarray], default_prompt: str) -> dict[str, Any]:
+def make_observation(
+    header: dict[str, Any],
+    imgs: dict[str, np.ndarray],
+    default_prompt: str,
+    camera_keys: dict[str, str],
+) -> dict[str, Any]:
     left = np.asarray(header.get("jleft", [0.0] * 7), dtype=np.float64)
     right = np.asarray(header.get("jright", [0.0] * 7), dtype=np.float64)
     if left.shape[-1] < 7 or right.shape[-1] < 7:
         raise ValueError(f"jleft/jright must be at least 7D, got {left.shape} and {right.shape}")
 
     return {
-        "video.front": _stack_single_frame(imgs["front"]),
-        "video.left_wrist": _stack_single_frame(imgs["left"]),
-        "video.right_wrist": _stack_single_frame(imgs["right"]),
+        camera_keys["front"]: _stack_single_frame(imgs["front"]),
+        camera_keys["left"]: _stack_single_frame(imgs["left"]),
+        camera_keys["right"]: _stack_single_frame(imgs["right"]),
         "state.left_arm": left[:7].reshape(1, 7),
         "state.right_arm": right[:7].reshape(1, 7),
         "annotation.human.task_description": str(header.get("task_prompt", default_prompt)),
@@ -203,9 +209,20 @@ class DreamZeroAgilexPolicy:
             model_path = model_path / "checkpoint-2000"
         self.default_prompt = str(cfg.get("task_prompt", "demo-task"))
         self.signal_group = signal_group
+        self.camera_keys = dict(cfg.get("camera_keys", {
+            "front": "video.front",
+            "left": "video.left_wrist",
+            "right": "video.right_wrist",
+        }))
+        if set(self.camera_keys) != {"front", "left", "right"}:
+            raise ValueError(f"camera_keys must define front/left/right, got {self.camera_keys}")
         max_chunk_size = int(cfg.get("max_chunk_size", 1))
+        num_inference_steps = int(cfg.get("num_inference_steps", 1))
+        if num_inference_steps < 1:
+            raise ValueError(f"num_inference_steps must be >= 1, got {num_inference_steps}")
         model_overrides = [
             f"action_head_cfg.config.diffusion_model_cfg.max_chunk_size={max_chunk_size}",
+            f"action_head_cfg.config.num_inference_timesteps={num_inference_steps}",
         ]
         self.policy = GrootSimPolicy(
             embodiment_tag=EmbodimentTag(str(cfg.get("embodiment", "xdof"))),
@@ -222,6 +239,7 @@ class DreamZeroAgilexPolicy:
             f"[dreamzero] model loaded path={model_path} device={device} "
             f"flash_cache={os.environ.get('ENABLE_DIT_CACHE')} "
             f"num_dit_steps={os.environ.get('NUM_DIT_STEPS', 'default')} "
+            f"num_inference_steps={num_inference_steps} "
             f"max_chunk_size={max_chunk_size}",
             flush=True,
         )
@@ -240,7 +258,7 @@ class DreamZeroAgilexPolicy:
         print(f"[dreamzero] eval transform max_chunk_size override applied to {changed} transform(s)", flush=True)
 
     def predict(self, header: dict[str, Any], imgs: dict[str, np.ndarray]) -> np.ndarray:
-        obs = make_observation(header, imgs, self.default_prompt)
+        obs = make_observation(header, imgs, self.default_prompt, self.camera_keys)
         if dist.get_world_size() > 1:
             broadcast_signal(0, self.signal_group)
             broadcast_obs_from_rank0(obs)
@@ -313,13 +331,14 @@ def run_inference_test(policy: DreamZeroAgilexPolicy, cfg: dict[str, Any]) -> No
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=Path(__file__).with_name("config_dreamzero_agilex.yaml"))
+    parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_dreamzero_agilex.yaml")
     parser.add_argument("--bind", default="", help="Override zmq.server_bind from config YAML")
     parser.add_argument("--flash", action="store_true", default=True, help="Enable DreamZero-Flash style DiT cache/mask")
     parser.add_argument("--no-flash", dest="flash", action="store_false", help="Disable Flash-style cache/mask")
-    parser.add_argument("--num-dit-steps", type=int, default=5, help="Number of DiT compute steps for Flash mask")
+    parser.add_argument("--num-dit-steps", type=int, default=1, help="DiT cache compute budget; use 1 for single-step Flash inference")
     parser.add_argument("--startup-test", action="store_true", help="Bind the socket, print readiness, and exit")
     parser.add_argument("--inference-test", action="store_true", help="Run one dummy inference, print value ranges, and exit")
+    parser.add_argument("--warmup", action="store_true", help="Run one dummy warmup before serving or inference testing")
     parser.add_argument("--timeout-seconds", type=int, default=50000)
     return parser.parse_args()
 
@@ -345,7 +364,7 @@ def main() -> None:
             worker_loop(policy, signal_group)
             return
 
-        if bool(cfg.get("warmup", False)):
+        if args.warmup or bool(cfg.get("warmup", False)):
             policy.warmup(cfg)
 
         if args.inference_test:
@@ -380,7 +399,7 @@ def main() -> None:
                     flush=True,
                 )
                 actions14 = policy.predict(header, imgs)
-                send_actions(sock, actions14, control_hz=control_hz, action_mode="joint_absolute")
+                send_actions(sock, actions14, control_hz=control_hz, action_mode="absolute")
                 print(
                     f"[dreamzero] response sent action_shape={actions14.shape} "
                     f"elapsed={time.perf_counter() - started:.3f}s",
@@ -390,13 +409,17 @@ def main() -> None:
                 break
             except Exception as exc:  # noqa: BLE001
                 print(f"[dreamzero] request error: {exc}", flush=True)
-                send_empty(sock, str(exc), action_mode="joint_absolute")
+                send_empty(sock, str(exc), action_mode="absolute")
     finally:
         if rank == 0 and world_size > 1:
             try:
                 broadcast_signal(1, signal_group)
             except Exception:
                 pass
+        # torchrun owns multi-rank process-group teardown. Explicitly destroying all
+        # groups here can hang while the inference-parallel P2P group is shutting down.
+        if dist.is_initialized() and world_size == 1:
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

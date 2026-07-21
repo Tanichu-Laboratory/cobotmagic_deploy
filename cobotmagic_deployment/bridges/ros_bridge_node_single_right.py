@@ -347,7 +347,7 @@ def load_config(path: Path) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=Path(__file__).with_name("config_single_right_openvla.yaml"))
+    parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_single_right_openvla.yaml")
     return parser.parse_args()
 
 

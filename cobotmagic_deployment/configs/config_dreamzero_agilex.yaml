@@ -2,10 +2,17 @@
 policy_backend: "dreamzero"
 
 dreamzero:
-  model_path: "/workspace/project/dreamzero/checkpoints/robomind_agilex_3rgb_lora_3gpu_gbs6_pdbs2_chunk4_10k_save2k_wandb_v4_alloc/checkpoint-2000"
+  model_path: "/workspace/project/dreamzero/checkpoints/xdof_square_stack_vifail_clean_agibot_flash_10k_merged"
   embodiment: "xdof"
+  # DreamZero-Flash was fine-tuned with decoupled video/action noise and is
+  # designed to reduce the diffusion trajectory to a single inference step.
+  num_inference_steps: 1
   # The local DreamZero inference path predicts one action/state chunk per call.
   max_chunk_size: 1
+  camera_keys:
+    front: "video.cam_high"
+    left: "video.cam_left_wrist"
+    right: "video.cam_right_wrist"
   warmup: false
   warmup_image_hw: [480, 640]
 

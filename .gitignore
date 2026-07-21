@@ -5,6 +5,9 @@ data/
 wandb/
 logs/
 
+# Local backup files.
+*.orig
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

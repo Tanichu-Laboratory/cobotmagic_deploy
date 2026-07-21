@@ -16,7 +16,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
 import yaml
-from policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
+from cobotmagic_deployment.common.policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
 
 
 IDENTITY_ROT6D = np.asarray([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
@@ -415,7 +415,7 @@ def run_inference_test(policy: Any, cfg: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=Path(__file__).with_name("config_xvla_agilex.yaml"))
+    parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_xvla_agilex.yaml")
     parser.add_argument("--bind", default="", help="Override zmq.server_bind from config YAML")
     parser.add_argument("--mock", action="store_true", help="Start protocol-compatible server without loading X-VLA")
     parser.add_argument("--startup-test", action="store_true", help="Bind the socket, print readiness, and exit")

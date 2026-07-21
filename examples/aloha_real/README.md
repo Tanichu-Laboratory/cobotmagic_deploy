@@ -4,10 +4,10 @@ This example demonstrates how to run with a real robot using an [ALOHA setup](ht
 
 ## Prerequisites
 
-This repo uses a fork of the ALOHA repo, with very minor modifications to use Realsense cameras.
-
-1. Follow the [hardware installation instructions](https://github.com/tonyzhaozh/aloha?tab=readme-ov-file#hardware-installation) in the ALOHA repo.
-1. Modify the `third_party/aloha/aloha_scripts/realsense_publisher.py` file to use serial numbers for your cameras.
+The ALOHA ROS package is not bundled with this deployment repository. Set it up in a separate ROS
+workspace by following the [ALOHA hardware installation instructions](https://github.com/tonyzhaozh/aloha?tab=readme-ov-file#hardware-installation).
+When using RealSense cameras, configure `aloha_scripts/realsense_publisher.py` in that external
+checkout with the serial numbers for your cameras.
 
 ## Without Docker
 
