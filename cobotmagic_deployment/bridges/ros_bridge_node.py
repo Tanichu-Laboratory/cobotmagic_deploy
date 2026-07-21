@@ -508,49 +508,58 @@ def have_obs(use_base=False, require_eef=False):
 
 
 def snapshot(task_prompt: str, use_base=False, include_eef=False):
+    """Capture a coherent observation while keeping callback lock time minimal."""
     with lock:
         required = ['front', 'left', 'right', 'jl', 'jr']
         if include_eef:
             required.extend(['eef_l', 'eef_r'])
         if not all(buf[key] is not None for key in required):
             return None
-        pkt = {
-            'task_prompt': task_prompt,
-            'front': bytes(buf['front']),
-            'left': bytes(buf['left']),
-            'right': bytes(buf['right']),
-            'jleft': list(buf['jl']),
-            'jright': list(buf['jr']),
-            'obs_seq': dict(buf_seq),
-            'obs_time': dict(buf_time),
-        }
-        if include_eef:
-            left_gripper = float(pkt['jleft'][-1])
-            right_gripper = float(pkt['jright'][-1])
-            current_eef_left = eef_pose_and_gripper_to_command(buf['eef_l'], left_gripper)
-            current_eef_right = eef_pose_and_gripper_to_command(buf['eef_r'], right_gripper)
-            pkt['current_eef_left'] = current_eef_left.tolist()
-            pkt['current_eef_right'] = current_eef_right.tolist()
-            pkt['xvla_proprio'] = np.concatenate([
-                eef_pose_and_gripper_to_ee6d(buf['eef_l'], left_gripper),
-                eef_pose_and_gripper_to_ee6d(buf['eef_r'], right_gripper),
-            ]).astype(np.float32).tolist()
-            pkt['hy_eef_state_wxyz'] = eef_pose_pair_to_hy_state_wxyz(
-                buf['eef_l'],
-                left_gripper,
-                buf['eef_r'],
-                right_gripper,
-            ).tolist()
-        else:
-            pkt['current_eef_left'] = None
-            pkt['current_eef_right'] = None
-            pkt['xvla_proprio'] = None
-            pkt['hy_eef_state_wxyz'] = None
-        if use_base and buf['odom'] is not None:
-            pkt['odom'] = list(buf['odom'])
-        else:
-            pkt['odom'] = None
-        return pkt
+        front = bytes(buf['front'])
+        left = bytes(buf['left'])
+        right = bytes(buf['right'])
+        jleft = list(buf['jl'])
+        jright = list(buf['jr'])
+        eef_left = list(buf['eef_l']) if include_eef else None
+        eef_right = list(buf['eef_r']) if include_eef else None
+        odom = list(buf['odom']) if use_base and buf['odom'] is not None else None
+        obs_seq = dict(buf_seq)
+        obs_time = dict(buf_time)
+
+    pkt = {
+        'task_prompt': task_prompt,
+        'front': front,
+        'left': left,
+        'right': right,
+        'jleft': jleft,
+        'jright': jright,
+        'obs_seq': obs_seq,
+        'obs_time': obs_time,
+    }
+    if include_eef:
+        left_gripper = float(jleft[-1])
+        right_gripper = float(jright[-1])
+        current_eef_left = eef_pose_and_gripper_to_command(eef_left, left_gripper)
+        current_eef_right = eef_pose_and_gripper_to_command(eef_right, right_gripper)
+        pkt['current_eef_left'] = current_eef_left.tolist()
+        pkt['current_eef_right'] = current_eef_right.tolist()
+        pkt['xvla_proprio'] = np.concatenate([
+            eef_pose_and_gripper_to_ee6d(eef_left, left_gripper),
+            eef_pose_and_gripper_to_ee6d(eef_right, right_gripper),
+        ]).astype(np.float32).tolist()
+        pkt['hy_eef_state_wxyz'] = eef_pose_pair_to_hy_state_wxyz(
+            eef_left,
+            left_gripper,
+            eef_right,
+            right_gripper,
+        ).tolist()
+    else:
+        pkt['current_eef_left'] = None
+        pkt['current_eef_right'] = None
+        pkt['xvla_proprio'] = None
+        pkt['hy_eef_state_wxyz'] = None
+    pkt['odom'] = odom
+    return pkt
 
 
 def latest_joint_arrays():
@@ -669,6 +678,24 @@ def smooth_action_chunk_savgol(mat, upsample_factor=2, window_length=21, polyord
         mode='interp',
     )
     return CubicSpline(upsampled_time, smoothed, axis=0)(source_time).astype(np.float32)
+
+
+def smooth_dual_action_chunks_savgol(left_mat, right_mat, upsample_factor=2, window_length=21, polyorder=3):
+    """Smooth both arms in one vectorized pass without coupling their columns."""
+    left_mat = np.asarray(left_mat, dtype=np.float32)
+    right_mat = np.asarray(right_mat, dtype=np.float32)
+    if left_mat.ndim != 2 or right_mat.ndim != 2 or left_mat.shape[0] != right_mat.shape[0]:
+        return left_mat.copy(), right_mat.copy()
+
+    left_width = left_mat.shape[1]
+    combined = np.concatenate((left_mat, right_mat), axis=1)
+    smoothed = smooth_action_chunk_savgol(
+        combined,
+        upsample_factor=upsample_factor,
+        window_length=window_length,
+        polyorder=polyorder,
+    )
+    return smoothed[:, :left_width].copy(), smoothed[:, left_width:].copy()
 
 
 def linear_upsample_chunk(mat, factor):
@@ -1697,6 +1724,11 @@ def main():
     action_filter_enabled = bool(action_filter_cfg.get('enabled', False))
     action_filter_alpha = float(action_filter_cfg.get('ema_alpha', 0.25))
     action_filter_alpha = min(max(action_filter_alpha, 0.0), 1.0)
+    chunk_smoothing_cfg = cfg['ros'].get('action_chunk_smoothing', {})
+    chunk_smoothing_enabled = bool(chunk_smoothing_cfg.get('enabled', False))
+    chunk_smoothing_upsample = max(int(chunk_smoothing_cfg.get('upsample_factor', 2)), 1)
+    chunk_smoothing_window = max(int(chunk_smoothing_cfg.get('window_length', 21)), 3)
+    chunk_smoothing_polyorder = max(int(chunk_smoothing_cfg.get('polyorder', 3)), 0)
     temporal_ensemble_cfg = cfg['ros'].get('temporal_ensemble', {})
     temporal_ensemble_enabled = bool(temporal_ensemble_cfg.get('enabled', False))
     temporal_exp_decay = float(temporal_ensemble_cfg.get('exp_decay', 0.7))
@@ -1965,6 +1997,13 @@ def main():
         rospy.loginfo(
             f"Action target EMA filter enabled: alpha={action_filter_alpha:.3f} "
             f"deadband={deadband.tolist()}"
+        )
+    if chunk_smoothing_enabled:
+        rospy.loginfo(
+            "DreamZero action chunk smoothing enabled: "
+            f"cubic_upsample={chunk_smoothing_upsample}x "
+            f"savgol_window={chunk_smoothing_window} "
+            f"polyorder={chunk_smoothing_polyorder}"
         )
     if temporal_ensemble_enabled:
         rospy.loginfo(
@@ -2317,6 +2356,14 @@ def main():
             return
         received_left_mat = left_mat.copy()
         received_right_mat = right_mat.copy()
+        if chunk_smoothing_enabled:
+            left_mat, right_mat = smooth_dual_action_chunks_savgol(
+                left_mat,
+                right_mat,
+                upsample_factor=chunk_smoothing_upsample,
+                window_length=chunk_smoothing_window,
+                polyorder=chunk_smoothing_polyorder,
+            )
 
         vel_mat = None
         next_frame_idx = 3

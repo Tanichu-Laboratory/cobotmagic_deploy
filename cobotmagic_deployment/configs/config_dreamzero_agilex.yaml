@@ -13,7 +13,8 @@ dreamzero:
     front: "video.cam_high"
     left: "video.cam_left_wrist"
     right: "video.cam_right_wrist"
-  warmup: false
+  warmup: true
+  warmup_runs: 3
   warmup_image_hw: [480, 640]
 
 task_prompt: "pick up the orange cube, and place it in the green box"
@@ -27,9 +28,9 @@ ros:
   max_image_age_sec: 2.0
   action_mode: "absolute"
   initial_action_skip_steps: 0
-  open_loop_steps: 8
+  open_loop_steps: 24
   policy_request:
-    when_live_chunk: "wait"
+    when_live_chunk: "allow"
   chunk_interpolation:
     enabled: false
     mode: "adaptive_delta"
@@ -67,6 +68,11 @@ ros:
     enabled: false
     ema_alpha: 1.0
     deadband: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  action_chunk_smoothing:
+    enabled: true
+    upsample_factor: 2
+    window_length: 21
+    polyorder: 3
   temporal_ensemble:
     enabled: false
     exp_decay: 0.4

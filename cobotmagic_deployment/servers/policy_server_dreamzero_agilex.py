@@ -58,6 +58,7 @@ def load_config(path: Path) -> dict[str, Any]:
 def setup_dreamzero_flash(enabled: bool, num_dit_steps: int) -> None:
     os.environ.setdefault("DREAMZERO_FAST_LOAD", "1")
     os.environ.setdefault("ATTENTION_BACKEND", "TE")
+    os.environ.setdefault("DREAMZERO_SKIP_UNUSED_CROSSATTN_CACHE", "1")
     os.environ["ENABLE_DIT_CACHE"] = "true" if enabled else "false"
     if enabled:
         os.environ["NUM_DIT_STEPS"] = str(num_dit_steps)
@@ -269,14 +270,24 @@ class DreamZeroAgilexPolicy:
         return action_batch_to_numpy(batch.act)
 
     def warmup(self, cfg: dict[str, Any]) -> None:
+        runs = max(int(cfg.get("warmup_runs", 3)), 1)
         height, width = [int(v) for v in cfg.get("warmup_image_hw", [480, 640])]
         dummy = np.zeros((height, width, 3), dtype=np.uint8)
         header = test_header(str(cfg.get("task_prompt", self.default_prompt)))
-        started = time.perf_counter()
-        actions = self.predict(header, {"front": dummy, "left": dummy, "right": dummy})
+        elapsed_values = []
+        actions = None
+        for run_index in range(runs):
+            started = time.perf_counter()
+            actions = self.predict(header, {"front": dummy, "left": dummy, "right": dummy})
+            elapsed = time.perf_counter() - started
+            elapsed_values.append(elapsed)
+            print(f"[dreamzero] warmup run={run_index + 1}/{runs} elapsed={elapsed:.3f}s", flush=True)
+
+        assert actions is not None
+        values = np.asarray(elapsed_values, dtype=np.float64)
         print(
-            f"[dreamzero] warmup done action_shape={actions.shape} "
-            f"elapsed={time.perf_counter() - started:.3f}s",
+            f"[dreamzero] warmup done action_shape={actions.shape} runs={runs} "
+            f"total={values.sum():.3f}s final={values[-1]:.3f}s",
             flush=True,
         )
 
@@ -318,15 +329,28 @@ def print_action_stats(label: str, actions14: np.ndarray) -> None:
     print(f"[{label}] last={actions14[-1].round(6).tolist()}", flush=True)
 
 
-def run_inference_test(policy: DreamZeroAgilexPolicy, cfg: dict[str, Any]) -> None:
+def run_inference_test(policy: DreamZeroAgilexPolicy, cfg: dict[str, Any], runs: int = 1) -> None:
+    runs = max(int(runs), 1)
     height, width = [int(v) for v in cfg.get("warmup_image_hw", [480, 640])]
     dummy = np.zeros((height, width, 3), dtype=np.uint8)
     header = test_header(str(cfg["task_prompt"]))
-    started = time.perf_counter()
-    actions14 = policy.predict(header, {"front": dummy, "left": dummy, "right": dummy})
-    elapsed = time.perf_counter() - started
+    elapsed_values = []
+    actions14 = None
+    for run_index in range(runs):
+        started = time.perf_counter()
+        actions14 = policy.predict(header, {"front": dummy, "left": dummy, "right": dummy})
+        elapsed = time.perf_counter() - started
+        elapsed_values.append(elapsed)
+        print(f"[dreamzero] benchmark run={run_index + 1}/{runs} elapsed={elapsed:.3f}s", flush=True)
+
+    assert actions14 is not None
     print_action_stats("dreamzero", actions14)
-    print(f"[dreamzero] inference elapsed={elapsed:.3f}s", flush=True)
+    values = np.asarray(elapsed_values, dtype=np.float64)
+    print(
+        f"[dreamzero] benchmark summary runs={runs} min={values.min():.3f}s "
+        f"median={np.median(values):.3f}s mean={values.mean():.3f}s max={values.max():.3f}s",
+        flush=True,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -338,6 +362,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-dit-steps", type=int, default=1, help="DiT cache compute budget; use 1 for single-step Flash inference")
     parser.add_argument("--startup-test", action="store_true", help="Bind the socket, print readiness, and exit")
     parser.add_argument("--inference-test", action="store_true", help="Run one dummy inference, print value ranges, and exit")
+    parser.add_argument("--benchmark-runs", type=int, default=1, help="Number of inference-test calls after warmup")
     parser.add_argument("--warmup", action="store_true", help="Run one dummy warmup before serving or inference testing")
     parser.add_argument("--timeout-seconds", type=int, default=50000)
     return parser.parse_args()
@@ -368,7 +393,7 @@ def main() -> None:
             policy.warmup(cfg)
 
         if args.inference_test:
-            run_inference_test(policy, cfg)
+            run_inference_test(policy, cfg, runs=args.benchmark_runs)
             if world_size > 1:
                 broadcast_signal(1, signal_group)
             return
