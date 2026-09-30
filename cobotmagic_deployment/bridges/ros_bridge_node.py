@@ -16,14 +16,19 @@ import json
 import os
 import threading
 import time
-import xml.etree.ElementTree as ET
 
 import cv2
 import numpy as np
 import yaml
 import zmq
+from cobotmagic_deployment.common.gripper_hysteresis import GripperHysteresis
+from cobotmagic_deployment.common.piper_ik import (
+    PiperNumericalIK, rpy_xyz_to_matrix, axis_angle_to_matrix,
+    transform_from_xyz_rpy, transform_from_pose_command, rotation_error_vector,
+    parse_float_triplet,
+)
 from scipy.interpolate import CubicSpline
-from scipy.signal import savgol_filter
+from scipy.signal import butter, savgol_filter, sosfiltfilt
 
 import rospy
 from cv_bridge import CvBridge
@@ -132,302 +137,6 @@ def eef_pose_and_gripper_to_command(pose, gripper):
         quat_xyzw_to_euler_xyz(pose_arr[3:7]),
         np.asarray([float(gripper)], dtype=np.float32),
     ])
-
-
-def eef_pose_pair_to_hy_state_wxyz(left_pose, left_gripper, right_pose, right_gripper):
-    left = np.asarray(left_pose, dtype=np.float32)
-    right = np.asarray(right_pose, dtype=np.float32)
-    return np.concatenate([
-        left[:3],
-        left[[6, 3, 4, 5]],
-        np.asarray([float(left_gripper)], dtype=np.float32),
-        right[:3],
-        right[[6, 3, 4, 5]],
-        np.asarray([float(right_gripper)], dtype=np.float32),
-    ]).astype(np.float32)
-
-
-
-
-def rpy_xyz_to_matrix(rpy):
-    roll, pitch, yaw = [float(v) for v in rpy]
-    sr, cr = np.sin(roll), np.cos(roll)
-    sp, cp = np.sin(pitch), np.cos(pitch)
-    sy, cy = np.sin(yaw), np.cos(yaw)
-    rx = np.asarray([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
-    ry = np.asarray([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
-    rz = np.asarray([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    return rz @ ry @ rx
-
-
-def axis_angle_to_matrix(axis, angle):
-    axis = np.asarray(axis, dtype=np.float64)
-    norm = np.linalg.norm(axis)
-    if norm <= 1e-12:
-        return np.eye(3, dtype=np.float64)
-    x, y, z = axis / norm
-    c = np.cos(float(angle))
-    s = np.sin(float(angle))
-    one_c = 1.0 - c
-    return np.asarray([
-        [c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s],
-        [y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s],
-        [z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c],
-    ], dtype=np.float64)
-
-
-def transform_from_xyz_rpy(xyz, rpy):
-    t = np.eye(4, dtype=np.float64)
-    t[:3, :3] = rpy_xyz_to_matrix(rpy)
-    t[:3, 3] = np.asarray(xyz, dtype=np.float64)
-    return t
-
-
-def transform_from_pose_command(cmd):
-    cmd = np.asarray(cmd, dtype=np.float64)
-    return transform_from_xyz_rpy(cmd[:3], cmd[3:6])
-
-
-def rotation_error_vector(target_rot, current_rot):
-    rot = target_rot @ current_rot.T
-    cos_angle = np.clip((np.trace(rot) - 1.0) * 0.5, -1.0, 1.0)
-    angle = float(np.arccos(cos_angle))
-    if angle < 1e-8:
-        return np.zeros(3, dtype=np.float64)
-    if np.pi - angle < 1e-5:
-        axis = np.sqrt(np.maximum(np.diag(rot) + 1.0, 0.0)) * 0.5
-        axis[0] = np.copysign(axis[0], rot[2, 1] - rot[1, 2])
-        axis[1] = np.copysign(axis[1], rot[0, 2] - rot[2, 0])
-        axis[2] = np.copysign(axis[2], rot[1, 0] - rot[0, 1])
-        norm = np.linalg.norm(axis)
-        if norm <= 1e-8:
-            axis = np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
-        else:
-            axis = axis / norm
-        return axis * angle
-    axis = np.asarray([
-        rot[2, 1] - rot[1, 2],
-        rot[0, 2] - rot[2, 0],
-        rot[1, 0] - rot[0, 1],
-    ], dtype=np.float64) / (2.0 * np.sin(angle))
-    return axis * angle
-
-
-def parse_float_triplet(text, default):
-    if text is None:
-        return np.asarray(default, dtype=np.float64)
-    return np.asarray([float(v) for v in text.split()], dtype=np.float64)
-
-
-class PiperNumericalIK:
-    def __init__(self, cfg):
-        self.urdf_path = os.path.expanduser(str(cfg.get(
-            'urdf_path',
-            '/workspace/project/X-VLA/evaluation/SoftFold-Agilex/Piper_ros_private-ros-noetic/src/piper_description/urdf/piper_description.urdf',
-        )))
-        self.base_link = str(cfg.get('base_link', 'base_link'))
-        self.tip_link = str(cfg.get('tip_link', 'link6'))
-        self.max_iters = max(int(cfg.get('max_iters', 80)), 1)
-        self.tolerance = max(float(cfg.get('tolerance', 1e-4)), 1e-8)
-        self.damping = max(float(cfg.get('damping', 0.03)), 1e-8)
-        self.fd_eps = max(float(cfg.get('finite_difference_eps', 1e-4)), 1e-7)
-        self.max_step = max(float(cfg.get('max_step_rad', 0.18)), 1e-4)
-        self.position_weight = max(float(cfg.get('position_weight', 1.0)), 0.0)
-        self.orientation_weight = max(float(cfg.get('orientation_weight', 0.25)), 0.0)
-        self.max_position_error_m = max(float(cfg.get('max_position_error_m', 0.04)), 0.0)
-        self.max_orientation_error_rad = max(float(cfg.get('max_orientation_error_rad', 0.8)), 0.0)
-        self.joint_regularization_weight = max(float(cfg.get('joint_regularization_weight', 0.08)), 0.0)
-        max_joint_delta = cfg.get('max_joint_delta_rad', [0.12, 0.12, 0.12, 0.16, 0.16, 0.16])
-        if isinstance(max_joint_delta, (int, float)):
-            max_joint_delta = [float(max_joint_delta)] * 6
-        self.max_joint_delta = np.asarray(max_joint_delta, dtype=np.float64)
-        if self.max_joint_delta.shape[0] != 6:
-            raise ValueError(f"eef_ik.max_joint_delta_rad must be scalar or 6D, got {self.max_joint_delta.shape}")
-        self.max_joint_delta = np.maximum(self.max_joint_delta, 0.0)
-        self.clip_to_max_joint_delta = bool(cfg.get('clip_to_max_joint_delta', True))
-        self.publish_on_failure = bool(cfg.get('publish_on_failure', False))
-        self.calibration = {}
-        self.chain = self._load_chain()
-        self.joint_indices = [idx for idx, joint in enumerate(self.chain) if joint['type'] in ('revolute', 'continuous')]
-        if len(self.joint_indices) != 6:
-            raise ValueError(
-                f"Piper IK expects 6 revolute joints from {self.base_link} to {self.tip_link}, "
-                f"got {len(self.joint_indices)} from {self.urdf_path}"
-            )
-        self.lower = np.asarray([self.chain[idx]['lower'] for idx in self.joint_indices], dtype=np.float64)
-        self.upper = np.asarray([self.chain[idx]['upper'] for idx in self.joint_indices], dtype=np.float64)
-
-    def _load_chain(self):
-        if not os.path.exists(self.urdf_path):
-            raise FileNotFoundError(f"EEF IK URDF not found: {self.urdf_path}")
-        root = ET.parse(self.urdf_path).getroot()
-        joints_by_parent = {}
-        for joint_elem in root.findall('joint'):
-            origin = joint_elem.find('origin')
-            axis = joint_elem.find('axis')
-            limit = joint_elem.find('limit')
-            parent_elem = joint_elem.find('parent')
-            child_elem = joint_elem.find('child')
-            if parent_elem is None or child_elem is None:
-                continue
-            joint = {
-                'name': joint_elem.get('name', ''),
-                'type': joint_elem.get('type', 'fixed'),
-                'parent': parent_elem.get('link'),
-                'child': child_elem.get('link'),
-                'origin_xyz': parse_float_triplet(None if origin is None else origin.get('xyz'), [0.0, 0.0, 0.0]),
-                'origin_rpy': parse_float_triplet(None if origin is None else origin.get('rpy'), [0.0, 0.0, 0.0]),
-                'axis': parse_float_triplet(None if axis is None else axis.get('xyz'), [0.0, 0.0, 1.0]),
-                'lower': -np.pi,
-                'upper': np.pi,
-            }
-            if limit is not None and joint['type'] != 'continuous':
-                joint['lower'] = float(limit.get('lower', joint['lower']))
-                joint['upper'] = float(limit.get('upper', joint['upper']))
-            joints_by_parent.setdefault(joint['parent'], []).append(joint)
-
-        visited = set()
-
-        def dfs(link, path):
-            if link == self.tip_link:
-                return path
-            if link in visited:
-                return None
-            visited.add(link)
-            for joint in joints_by_parent.get(link, []):
-                result = dfs(joint['child'], path + [joint])
-                if result is not None:
-                    return result
-            return None
-
-        chain = dfs(self.base_link, [])
-        if chain is None:
-            raise ValueError(f"No URDF chain found from {self.base_link} to {self.tip_link} in {self.urdf_path}")
-        return chain
-
-    def fk(self, q):
-        q = np.asarray(q, dtype=np.float64)[:6]
-        t = np.eye(4, dtype=np.float64)
-        q_idx = 0
-        for joint in self.chain:
-            t = t @ transform_from_xyz_rpy(joint['origin_xyz'], joint['origin_rpy'])
-            if joint['type'] in ('revolute', 'continuous'):
-                rot = np.eye(4, dtype=np.float64)
-                rot[:3, :3] = axis_angle_to_matrix(joint['axis'], q[q_idx])
-                t = t @ rot
-                q_idx += 1
-        return t
-
-    def calibrate(self, side, joints, current_eef_cmd):
-        joints = np.asarray(joints, dtype=np.float64)
-        current_eef = np.asarray(current_eef_cmd, dtype=np.float64)
-        if joints.shape[0] < 6 or current_eef.shape[0] < 6:
-            return False
-        model_fk = self.fk(joints[:6])
-        measured = transform_from_pose_command(current_eef)
-        self.calibration[side] = measured @ np.linalg.inv(model_fk)
-        rospy.loginfo(
-            f"EEF IK calibrated for {side}: "
-            f"measured_xyz={current_eef[:3].tolist()} seed_joints={joints[:6].tolist()}"
-        )
-        return True
-
-    def _model_target(self, side, target_eef_cmd):
-        target = transform_from_pose_command(target_eef_cmd)
-        calib = self.calibration.get(side)
-        if calib is None:
-            return target
-        return np.linalg.inv(calib) @ target
-
-    def _error(self, target, q):
-        current = self.fk(q)
-        pos_error = target[:3, 3] - current[:3, 3]
-        rot_error = rotation_error_vector(target[:3, :3], current[:3, :3])
-        weighted = np.concatenate([
-            pos_error * self.position_weight,
-            rot_error * self.orientation_weight,
-        ])
-        return weighted, pos_error, rot_error
-
-    def _jacobian(self, target, q, base_error):
-        jac = np.zeros((6, 6), dtype=np.float64)
-        for idx in range(6):
-            q_step = q.copy()
-            q_step[idx] += self.fd_eps
-            q_step = np.clip(q_step, self.lower, self.upper)
-            denom = q_step[idx] - q[idx]
-            if abs(denom) < 1e-12:
-                q_step[idx] -= self.fd_eps
-                q_step = np.clip(q_step, self.lower, self.upper)
-                denom = q_step[idx] - q[idx]
-            if abs(denom) < 1e-12:
-                continue
-            step_error, _, _ = self._error(target, q_step)
-            jac[:, idx] = (step_error - base_error) / denom
-        return jac
-
-    def solve(self, side, target_eef_cmd, seed_joints):
-        seed_joints = np.asarray(seed_joints, dtype=np.float64)
-        target_eef_cmd = np.asarray(target_eef_cmd, dtype=np.float64)
-        if seed_joints.shape[0] < 6 or target_eef_cmd.shape[0] < 7:
-            raise ValueError("IK solve requires 6 joint seed values and a 7D EEF target")
-        seed_q = np.clip(seed_joints[:6].copy(), self.lower, self.upper)
-        q = seed_q.copy()
-        target = self._model_target(side, target_eef_cmd)
-        pos_error = np.zeros(3, dtype=np.float64)
-        rot_error = np.zeros(3, dtype=np.float64)
-        converged = False
-        for _ in range(self.max_iters):
-            error, pos_error, rot_error = self._error(target, q)
-            if np.linalg.norm(error) <= self.tolerance:
-                converged = True
-                break
-            jac = self._jacobian(target, q, error)
-            if self.joint_regularization_weight > 0.0:
-                reg_jac = self.joint_regularization_weight * np.eye(6, dtype=np.float64)
-                reg_error = self.joint_regularization_weight * (q - seed_q)
-                jac_aug = np.vstack([jac, reg_jac])
-                error_aug = np.concatenate([error, reg_error])
-            else:
-                jac_aug = jac
-                error_aug = error
-            lhs = jac_aug.T @ jac_aug + (self.damping ** 2) * np.eye(6, dtype=np.float64)
-            rhs = jac_aug.T @ error_aug
-            dq = -np.linalg.solve(lhs, rhs)
-            step_norm = np.linalg.norm(dq)
-            if step_norm > self.max_step:
-                dq = dq * (self.max_step / step_norm)
-            q = np.clip(q + dq, self.lower, self.upper)
-        unclipped_q = q.copy()
-        joint_delta_limited = False
-        if self.clip_to_max_joint_delta and np.any(self.max_joint_delta > 0.0):
-            delta = np.clip(q - seed_q, -self.max_joint_delta, self.max_joint_delta)
-            limited_q = np.clip(seed_q + delta, self.lower, self.upper)
-            joint_delta_limited = bool(np.linalg.norm(limited_q - q) > 1e-8)
-            q = limited_q
-        _, pos_error, rot_error = self._error(target, q)
-        pos_norm = float(np.linalg.norm(pos_error))
-        rot_norm = float(np.linalg.norm(rot_error))
-        acceptable = (
-            converged
-            or (
-                (self.max_position_error_m <= 0.0 or pos_norm <= self.max_position_error_m)
-                and (self.max_orientation_error_rad <= 0.0 or rot_norm <= self.max_orientation_error_rad)
-            )
-        )
-        joint_target = np.zeros(7, dtype=np.float32)
-        joint_target[:6] = q.astype(np.float32)
-        joint_target[6] = float(target_eef_cmd[6])
-        return {
-            'joints': joint_target,
-            'converged': bool(converged),
-            'acceptable': bool(acceptable),
-            'position_error_m': pos_norm,
-            'orientation_error_rad': rot_norm,
-            'joint_delta_limited': joint_delta_limited,
-            'joint_delta_norm': float(np.linalg.norm(q - seed_q)),
-            'unclipped_joint_delta_norm': float(np.linalg.norm(unclipped_q - seed_q)),
-        }
 
 
 def img_cb(which, mode='raw', quality=80):
@@ -547,17 +256,10 @@ def snapshot(task_prompt: str, use_base=False, include_eef=False):
             eef_pose_and_gripper_to_ee6d(eef_left, left_gripper),
             eef_pose_and_gripper_to_ee6d(eef_right, right_gripper),
         ]).astype(np.float32).tolist()
-        pkt['hy_eef_state_wxyz'] = eef_pose_pair_to_hy_state_wxyz(
-            eef_left,
-            left_gripper,
-            eef_right,
-            right_gripper,
-        ).tolist()
     else:
         pkt['current_eef_left'] = None
         pkt['current_eef_right'] = None
         pkt['xvla_proprio'] = None
-        pkt['hy_eef_state_wxyz'] = None
     pkt['odom'] = odom
     return pkt
 
@@ -646,6 +348,129 @@ def threshold_gripper_targets(target_left, target_right, close_thresholds, open_
     return out_left, out_right
 
 
+def scale_gripper_deltas(
+    target_left,
+    target_right,
+    reference_left,
+    reference_right,
+    gains,
+    clip_min=None,
+    clip_max=None,
+):
+    """Scale only the gripper displacement from a request-time reference."""
+    out_left = np.asarray(target_left, dtype=np.float32).copy()
+    out_right = np.asarray(target_right, dtype=np.float32).copy()
+    ref_left = np.asarray(reference_left, dtype=np.float32)
+    ref_right = np.asarray(reference_right, dtype=np.float32)
+    gains = np.asarray(gains, dtype=np.float32)
+    if out_left.size == 0 or out_right.size == 0 or ref_left.size == 0 or ref_right.size == 0:
+        return out_left, out_right
+    if gains.shape != (2,):
+        raise ValueError(f"gripper delta gains must have shape (2,), got {gains.shape}")
+
+    out_left[-1] = ref_left[-1] + gains[0] * (out_left[-1] - ref_left[-1])
+    out_right[-1] = ref_right[-1] + gains[1] * (out_right[-1] - ref_right[-1])
+    if clip_min is not None:
+        clip_min = np.asarray(clip_min, dtype=np.float32)
+        out_left[-1] = max(out_left[-1], clip_min[0])
+        out_right[-1] = max(out_right[-1], clip_min[1])
+    if clip_max is not None:
+        clip_max = np.asarray(clip_max, dtype=np.float32)
+        out_left[-1] = min(out_left[-1], clip_max[0])
+        out_right[-1] = min(out_right[-1], clip_max[1])
+    return out_left, out_right
+
+
+def filter_chunk_by_terminal_displacement(
+    left_mat,
+    right_mat,
+    initial_left,
+    initial_right,
+    steps_to_execute,
+    left_threshold,
+    right_threshold,
+):
+    """Cancel a joint's whole chunk when its consumed endpoint has no net displacement."""
+    out_left = np.asarray(left_mat, dtype=np.float32).copy()
+    out_right = np.asarray(right_mat, dtype=np.float32).copy()
+    initial_left = np.asarray(initial_left, dtype=np.float32)
+    initial_right = np.asarray(initial_right, dtype=np.float32)
+    left_threshold = np.asarray(left_threshold, dtype=np.float32)
+    right_threshold = np.asarray(right_threshold, dtype=np.float32)
+    if out_left.ndim != 2 or out_right.ndim != 2 or out_left.shape[0] != out_right.shape[0]:
+        raise ValueError("terminal displacement filter expects left/right 2D chunks with equal horizons")
+    if initial_left.shape != (out_left.shape[1],) or initial_right.shape != (out_right.shape[1],):
+        raise ValueError("terminal displacement filter initial state width does not match action width")
+    if left_threshold.shape != initial_left.shape or right_threshold.shape != initial_right.shape:
+        raise ValueError("terminal displacement filter thresholds must match the left/right action widths")
+    if out_left.shape[0] == 0:
+        return out_left, out_right, np.zeros_like(initial_left), np.zeros_like(initial_right), np.zeros_like(initial_left, dtype=bool), np.zeros_like(initial_right, dtype=bool), -1
+
+    endpoint_index = min(max(int(steps_to_execute), 1), out_left.shape[0]) - 1
+    left_delta = out_left[endpoint_index] - initial_left
+    right_delta = out_right[endpoint_index] - initial_right
+    cancel_left = np.abs(left_delta) < left_threshold
+    cancel_right = np.abs(right_delta) < right_threshold
+    out_left[:, cancel_left] = initial_left[cancel_left]
+    out_right[:, cancel_right] = initial_right[cancel_right]
+    return out_left, out_right, left_delta, right_delta, cancel_left, cancel_right, endpoint_index
+
+
+def override_arm_delta_from_initial_pose(
+    target_left,
+    target_right,
+    initial_left,
+    initial_right,
+    override_left,
+    override_right,
+    include_gripper=False,
+):
+    """Make the selected arm's command delta from its chunk-start pose exactly zero."""
+    out_left = np.asarray(target_left, dtype=np.float32).copy()
+    out_right = np.asarray(target_right, dtype=np.float32).copy()
+    initial_left = np.asarray(initial_left, dtype=np.float32)
+    initial_right = np.asarray(initial_right, dtype=np.float32)
+    if out_left.shape != initial_left.shape or out_right.shape != initial_right.shape:
+        raise ValueError("initial-pose delta override target and initial-state widths must match")
+
+    stop = out_left.shape[0] if include_gripper else max(out_left.shape[0] - 1, 0)
+    if override_left:
+        out_left[:stop] = initial_left[:stop]
+    if override_right:
+        out_right[:stop] = initial_right[:stop]
+    return out_left, out_right
+
+
+def scale_action_delta_from_reference(
+    target_left,
+    target_right,
+    reference_left,
+    reference_right,
+    coefficient,
+    include_gripper=False,
+):
+    """Scale an action delta from a reference while optionally preserving grippers."""
+    out_left = np.asarray(target_left, dtype=np.float32).copy()
+    out_right = np.asarray(target_right, dtype=np.float32).copy()
+    reference_left = np.asarray(reference_left, dtype=np.float32)
+    reference_right = np.asarray(reference_right, dtype=np.float32)
+    if out_left.shape != reference_left.shape or out_right.shape != reference_right.shape:
+        raise ValueError("action-delta scale target and reference widths must match")
+
+    coefficient = float(coefficient)
+    left_stop = out_left.shape[0] if include_gripper else max(out_left.shape[0] - 1, 0)
+    right_stop = out_right.shape[0] if include_gripper else max(out_right.shape[0] - 1, 0)
+    out_left[:left_stop] = (
+        reference_left[:left_stop]
+        + coefficient * (out_left[:left_stop] - reference_left[:left_stop])
+    )
+    out_right[:right_stop] = (
+        reference_right[:right_stop]
+        + coefficient * (out_right[:right_stop] - reference_right[:right_stop])
+    )
+    return out_left, out_right
+
+
 def smooth_action_chunk_savgol(mat, upsample_factor=2, window_length=21, polyorder=3):
     """Apply the DreamZero paper's cubic-upsample/Savitzky-Golay smoothing."""
     mat = np.asarray(mat, dtype=np.float32)
@@ -696,6 +521,170 @@ def smooth_dual_action_chunks_savgol(left_mat, right_mat, upsample_factor=2, win
         polyorder=polyorder,
     )
     return smoothed[:, :left_width].copy(), smoothed[:, left_width:].copy()
+
+
+def lowpass_action_chunk_zero_phase(
+    mat,
+    sample_rate_hz,
+    cutoff_hz,
+    order=4,
+    preserve_endpoints=True,
+    include_gripper=False,
+):
+    """Remove chunk-wide high-frequency motion without phase delay."""
+    mat = np.asarray(mat, dtype=np.float32)
+    if mat.ndim != 2:
+        raise ValueError("chunk low-pass input must be a 2D action matrix")
+    if mat.shape[0] < 3 or mat.shape[1] == 0:
+        return mat.copy()
+
+    sample_rate_hz = float(sample_rate_hz)
+    cutoff_hz = float(cutoff_hz)
+    order = max(int(order), 1)
+    if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
+        raise ValueError("chunk low-pass sample_rate_hz must be positive")
+    nyquist_hz = 0.5 * sample_rate_hz
+    if (
+        not np.isfinite(cutoff_hz)
+        or cutoff_hz <= 0.0
+        or cutoff_hz >= nyquist_hz
+    ):
+        raise ValueError(
+            "chunk low-pass cutoff_hz must be between 0 and Nyquist "
+            f"({nyquist_hz:.6g} Hz), got {cutoff_hz}"
+        )
+
+    stop = mat.shape[1] if include_gripper else max(mat.shape[1] - 1, 0)
+    if stop == 0:
+        return mat.copy()
+    source = mat[:, :stop].astype(np.float64, copy=False)
+    sos = butter(order, cutoff_hz, btype='lowpass', fs=sample_rate_hz, output='sos')
+    # Bound padding by the short action horizon instead of relying on scipy's
+    # default, which can reject otherwise valid small chunks.
+    padlen = min(3 * (2 * len(sos) + 1), mat.shape[0] - 1)
+    filtered = sosfiltfilt(sos, source, axis=0, padlen=padlen)
+
+    if preserve_endpoints:
+        progress = np.linspace(0.0, 1.0, mat.shape[0], dtype=np.float64)[:, None]
+        filtered += (
+            (1.0 - progress) * (source[:1] - filtered[:1])
+            + progress * (source[-1:] - filtered[-1:])
+        )
+
+    if not np.all(np.isfinite(filtered)):
+        raise ValueError("chunk low-pass produced non-finite values")
+    out = mat.copy()
+    out[:, :stop] = filtered.astype(np.float32)
+    return out
+
+
+def lowpass_dual_action_chunks_zero_phase(
+    left_mat,
+    right_mat,
+    sample_rate_hz,
+    cutoff_hz,
+    order=4,
+    preserve_endpoints=True,
+    include_gripper=False,
+):
+    """Apply the same zero-phase low-pass independently to both arms."""
+    left_mat = np.asarray(left_mat, dtype=np.float32)
+    right_mat = np.asarray(right_mat, dtype=np.float32)
+    if (
+        left_mat.ndim != 2
+        or right_mat.ndim != 2
+        or left_mat.shape[0] != right_mat.shape[0]
+    ):
+        raise ValueError("left/right low-pass chunks must be aligned 2D matrices")
+    # Each arm owns a gripper column, so filter them separately to exclude both.
+    left_out = lowpass_action_chunk_zero_phase(
+        left_mat, sample_rate_hz, cutoff_hz, order,
+        preserve_endpoints, include_gripper,
+    )
+    right_out = lowpass_action_chunk_zero_phase(
+        right_mat, sample_rate_hz, cutoff_hz, order,
+        preserve_endpoints, include_gripper,
+    )
+    return left_out, right_out
+
+
+def _isotonic_nondecreasing_l2(values):
+    """Least-squares projection onto a nondecreasing sequence (PAVA)."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError("isotonic projection input must be one-dimensional")
+    block_values = []
+    block_weights = []
+    block_counts = []
+    for value in values:
+        block_values.append(float(value))
+        block_weights.append(1.0)
+        block_counts.append(1)
+        while (
+            len(block_values) >= 2
+            and block_values[-2] > block_values[-1]
+        ):
+            weight = block_weights[-2] + block_weights[-1]
+            block_values[-2] = (
+                block_values[-2] * block_weights[-2]
+                + block_values[-1] * block_weights[-1]
+            ) / weight
+            block_weights[-2] = weight
+            block_counts[-2] += block_counts[-1]
+            block_values.pop()
+            block_weights.pop()
+            block_counts.pop()
+    return np.concatenate([
+        np.full(count, value, dtype=np.float64)
+        for value, count in zip(block_values, block_counts)
+    ])
+
+
+def project_action_chunk_monotonic_to_endpoint(
+    mat,
+    start,
+    strength=1.0,
+    min_terminal_delta=1e-4,
+    include_gripper=False,
+):
+    """Suppress per-joint reversals while preserving the chunk endpoint."""
+    mat = np.asarray(mat, dtype=np.float32)
+    start = np.asarray(start, dtype=np.float32)
+    if mat.ndim != 2 or start.shape != (mat.shape[1],):
+        raise ValueError("monotonic chunk input/start shape mismatch")
+    if mat.shape[0] == 0:
+        return mat.copy()
+    strength = float(strength)
+    min_terminal_delta = max(float(min_terminal_delta), 0.0)
+    if not np.isfinite(strength) or not 0.0 <= strength <= 1.0:
+        raise ValueError("monotonic chunk strength must be in [0, 1]")
+    stop = mat.shape[1] if include_gripper else max(mat.shape[1] - 1, 0)
+    projected = mat.astype(np.float64, copy=True)
+    source = mat.astype(np.float64, copy=False)
+    start64 = start.astype(np.float64, copy=False)
+    for axis in range(stop):
+        endpoint = source[-1, axis]
+        terminal_delta = endpoint - start64[axis]
+        if abs(terminal_delta) <= min_terminal_delta:
+            projected[:, axis] = endpoint
+            continue
+        direction = 1.0 if terminal_delta > 0.0 else -1.0
+        terminal_progress = abs(terminal_delta)
+        progress = direction * (
+            np.concatenate(([start64[axis]], source[:, axis])) - start64[axis]
+        )
+        progress = np.clip(progress, 0.0, terminal_progress)
+        monotonic_progress = _isotonic_nondecreasing_l2(progress)
+        projected[:, axis] = (
+            start64[axis] + direction * monotonic_progress[1:]
+        )
+        # Endpoint preservation is exact, independent of floating-point pooling.
+        projected[-1, axis] = endpoint
+    out = source + strength * (projected - source)
+    out[-1, :stop] = source[-1, :stop]
+    if not np.all(np.isfinite(out)):
+        raise ValueError("monotonic chunk projection produced non-finite values")
+    return out.astype(np.float32)
 
 
 def linear_upsample_chunk(mat, factor):
@@ -780,6 +769,19 @@ def split_joint_threshold(joint_threshold, left_dim, right_dim):
     return np.maximum(threshold_left, 1e-6), np.maximum(threshold_right, 1e-6)
 
 
+def interpolate_arm_command_keep_gripper(start, target, alpha):
+    """Linearly interpolate arm axes while applying the gripper target immediately."""
+    start = np.asarray(start, dtype=np.float32)
+    target = np.asarray(target, dtype=np.float32)
+    if start.shape != target.shape:
+        raise ValueError("command interpolation endpoints must have matching shapes")
+    out = target.copy()
+    if out.shape[0] > 1:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        out[:-1] = start[:-1] + alpha * (target[:-1] - start[:-1])
+    return out
+
+
 def adaptive_bridge_to_first_action(
     left_mat,
     right_mat,
@@ -810,8 +812,14 @@ def adaptive_bridge_to_first_action(
     right_bridge = []
     for step in range(1, factor):
         alpha = float(step) / float(factor)
-        left_bridge.append((1.0 - alpha) * command_left + alpha * left_mat[0])
-        right_bridge.append((1.0 - alpha) * command_right + alpha * right_mat[0])
+        left_step = interpolate_arm_command_keep_gripper(
+            command_left, left_mat[0], alpha
+        )
+        right_step = interpolate_arm_command_keep_gripper(
+            command_right, right_mat[0], alpha
+        )
+        left_bridge.append(left_step)
+        right_bridge.append(right_step)
     left_out = np.vstack([np.asarray(left_bridge, dtype=np.float32), left_mat])
     right_out = np.vstack([np.asarray(right_bridge, dtype=np.float32), right_mat])
     offset = factor - 1
@@ -923,6 +931,13 @@ def make_action_logger(cfg, rate_hz):
         'delta_clip_enabled',
         'delta_clip_reference',
         'command_delta_deadband_enabled',
+        'first_action_delta_scale_enabled',
+        'first_action_delta_scale_coefficient',
+        'first_action_delta_scale_include_gripper',
+        'first_action_delta_scale_applied',
+        'initial_pose_delta_override_enabled',
+        'initial_pose_delta_override_arms',
+        'initial_pose_delta_override_include_gripper',
         'temporal_ensemble_count',
         'temporal_ensemble_weights',
         'current_left',
@@ -943,6 +958,10 @@ def make_action_logger(cfg, rate_hz):
         'filtered_right',
         'target_left',
         'target_right',
+        'ik_seed_joint_left',
+        'ik_seed_joint_right',
+        'ik_diagnostics_left',
+        'ik_diagnostics_right',
         'ik_joint_left',
         'ik_joint_right',
         'ik_left_position_error_m',
@@ -998,6 +1017,7 @@ def make_action_logger(cfg, rate_hz):
         'right_gripper_raw',
         'right_gripper_ensembled',
         'right_gripper_target',
+        'gripper_hysteresis',
         'base_vel',
     ]
     f = open(path, 'w', newline='', encoding='utf-8')
@@ -1085,6 +1105,55 @@ def save_action_chunk(logger, request_id, chunk):
         'request_obs_seq': dict(chunk['request_obs_seq']),
         'request_snapshot_dir': chunk.get('request_snapshot_dir', ''),
         'policy_gripper_input': dict(chunk.get('policy_gripper_input', {})),
+        'terminal_filter_enabled': bool(chunk.get('terminal_filter_enabled', False)),
+        'terminal_endpoint_index': int(chunk.get('terminal_endpoint_index', -1)),
+        'terminal_delta_left': np.asarray(chunk.get('terminal_delta_left', []), dtype=np.float32).tolist(),
+        'terminal_delta_right': np.asarray(chunk.get('terminal_delta_right', []), dtype=np.float32).tolist(),
+        'terminal_cancel_left': np.asarray(chunk.get('terminal_cancel_left', []), dtype=bool).tolist(),
+        'terminal_cancel_right': np.asarray(chunk.get('terminal_cancel_right', []), dtype=bool).tolist(),
+        'initial_pose_delta_override_enabled': bool(
+            chunk.get('initial_pose_delta_override_enabled', False)
+        ),
+        'initial_pose_delta_override_arms': list(
+            chunk.get('initial_pose_delta_override_arms', [])
+        ),
+        'initial_pose_delta_override_include_gripper': bool(
+            chunk.get('initial_pose_delta_override_include_gripper', False)
+        ),
+        'first_action_delta_scale_enabled': bool(
+            chunk.get('first_action_delta_scale_enabled', False)
+        ),
+        'first_action_delta_scale_coefficient': float(
+            chunk.get('first_action_delta_scale_coefficient', 1.0)
+        ),
+        'first_action_delta_scale_include_gripper': bool(
+            chunk.get('first_action_delta_scale_include_gripper', False)
+        ),
+        'initial_bridge_factor': int(chunk.get('initial_bridge_factor', 1)),
+        'initial_bridge_added_steps': int(
+            chunk.get('initial_bridge_added_steps', 0)
+        ),
+        'chunk_lowpass_enabled': bool(chunk.get('chunk_lowpass_enabled', False)),
+        'chunk_lowpass_cutoff_hz': float(
+            chunk.get('chunk_lowpass_cutoff_hz', 0.0)
+        ),
+        'chunk_lowpass_sample_rate_hz': float(
+            chunk.get('chunk_lowpass_sample_rate_hz', 0.0)
+        ),
+        'chunk_lowpass_order': int(chunk.get('chunk_lowpass_order', 0)),
+        'chunk_lowpass_preserve_endpoints': bool(
+            chunk.get('chunk_lowpass_preserve_endpoints', False)
+        ),
+        'chunk_monotonic_enabled': bool(
+            chunk.get('chunk_monotonic_enabled', False)
+        ),
+        'chunk_monotonic_arms': list(chunk.get('chunk_monotonic_arms', [])),
+        'chunk_monotonic_strength': float(
+            chunk.get('chunk_monotonic_strength', 0.0)
+        ),
+        'chunk_monotonic_min_terminal_delta': float(
+            chunk.get('chunk_monotonic_min_terminal_delta', 0.0)
+        ),
     }
     np.savez_compressed(
         path,
@@ -1092,6 +1161,10 @@ def save_action_chunk(logger, request_id, chunk):
         processed_right=chunk['right'],
         received_left=chunk.get('received_left', chunk['left']),
         received_right=chunk.get('received_right', chunk['right']),
+        lowpass_left=chunk.get('lowpass_left', chunk['left']),
+        lowpass_right=chunk.get('lowpass_right', chunk['right']),
+        monotonic_left=chunk.get('monotonic_left', chunk['left']),
+        monotonic_right=chunk.get('monotonic_right', chunk['right']),
         model_raw_left=np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_left') is None else chunk['model_raw_left'],
         model_raw_right=np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_right') is None else chunk['model_raw_right'],
         vel=np.empty((0, 0), dtype=np.float32) if chunk['vel'] is None else chunk['vel'],
@@ -1099,6 +1172,10 @@ def save_action_chunk(logger, request_id, chunk):
         request_current_right=chunk['request_current_right'],
         request_measured_left=chunk.get('request_measured_left', chunk['request_current_left']),
         request_measured_right=chunk.get('request_measured_right', chunk['request_current_right']),
+        terminal_delta_left=np.asarray(chunk.get('terminal_delta_left', []), dtype=np.float32),
+        terminal_delta_right=np.asarray(chunk.get('terminal_delta_right', []), dtype=np.float32),
+        terminal_cancel_left=np.asarray(chunk.get('terminal_cancel_left', []), dtype=bool),
+        terminal_cancel_right=np.asarray(chunk.get('terminal_cancel_right', []), dtype=bool),
         meta=json.dumps(meta, separators=(',', ':')),
     )
     return path
@@ -1478,7 +1555,12 @@ def move_to_home(
     settle_hold_sec=0.5,
     settle_timeout_sec=8.0,
     settle_rate_hz=None,
+    gripper_move_start_fraction=None,
 ):
+    if gripper_move_start_fraction is not None:
+        gripper_move_start_fraction = float(gripper_move_start_fraction)
+        if mode != "linear" or not 0.0 <= gripper_move_start_fraction < 1.0:
+            raise ValueError("gripper_move_start_fraction requires linear mode and 0 <= value < 1")
     jl, jr = wait_for_joint_arrays()
     if jl is None or jr is None:
         rospy.logwarn("home move skipped: joint state not available")
@@ -1492,8 +1574,18 @@ def move_to_home(
         steps = max(int(num_steps or 100), 1)
         left_traj = np.linspace(cur_left, target_left, steps, dtype=np.float32)
         right_traj = np.linspace(cur_right, target_right, steps, dtype=np.float32)
-        left_traj[:, -1] = target_left[-1]
-        right_traj[:, -1] = target_right[-1]
+        if gripper_move_start_fraction is None:
+            # Preserve the original immediate gripper target for other configs.
+            left_traj[:, -1] = target_left[-1]
+            right_traj[:, -1] = target_right[-1]
+        else:
+            progress = np.linspace(0.0, 1.0, steps) if steps > 1 else np.ones(1)
+            grip_progress = np.clip(
+                (progress - gripper_move_start_fraction) / (1.0 - gripper_move_start_fraction),
+                0.0, 1.0,
+            )
+            left_traj[:, -1] = cur_left[-1] + grip_progress * (target_left[-1] - cur_left[-1])
+            right_traj[:, -1] = cur_right[-1] + grip_progress * (target_right[-1] - cur_right[-1])
         for left_pos, right_pos in zip(left_traj, right_traj):
             publish_joint_pair(pub_l, pub_r, name_list, left_pos, right_pos)
             rate.sleep()
@@ -1587,6 +1679,8 @@ def execute_home_phase(
         settle_hold_sec=settle_hold_sec,
         settle_timeout_sec=settle_timeout_sec,
         settle_rate_hz=settle_rate_hz,
+        gripper_move_start_fraction=phase_cfg.get(
+            'gripper_move_start_fraction', home_cfg.get('gripper_move_start_fraction')),
     )
 
 
@@ -1706,8 +1800,79 @@ def main():
     delta_clip_enabled = bool(delta_clip_cfg and delta_clip_cfg.get('enabled', False))
     command_delta_deadband_cfg = cfg['ros'].get('command_delta_deadband', {})
     command_delta_deadband_enabled = bool(command_delta_deadband_cfg.get('enabled', False))
+    first_action_delta_scale_cfg = cfg['ros'].get('first_action_delta_scale', {})
+    first_action_delta_scale_enabled = bool(first_action_delta_scale_cfg.get('enabled', False))
+    first_action_delta_scale_raw = float(first_action_delta_scale_cfg.get('coefficient', 1.0))
+    first_action_delta_scale_coefficient = float(np.clip(first_action_delta_scale_raw, 0.0, 1.0))
+    if first_action_delta_scale_coefficient != first_action_delta_scale_raw:
+        rospy.logwarn(
+            "first_action_delta_scale.coefficient must be in [0, 1]; "
+            f"clamped {first_action_delta_scale_raw} to {first_action_delta_scale_coefficient}."
+        )
+    first_action_delta_scale_include_gripper = bool(
+        first_action_delta_scale_cfg.get('include_gripper', False)
+    )
+    initial_pose_override_cfg = cfg['ros'].get('initial_pose_delta_override', {})
+    initial_pose_override_enabled = bool(initial_pose_override_cfg.get('enabled', False))
+    initial_pose_override_arms_cfg = initial_pose_override_cfg.get('arms', [])
+    if isinstance(initial_pose_override_arms_cfg, str):
+        initial_pose_override_arms_cfg = [initial_pose_override_arms_cfg]
+    initial_pose_override_arms = {
+        str(arm).strip().lower() for arm in initial_pose_override_arms_cfg
+    }
+    if 'both' in initial_pose_override_arms:
+        initial_pose_override_arms.update(('left', 'right'))
+        initial_pose_override_arms.discard('both')
+    invalid_override_arms = initial_pose_override_arms - {'left', 'right'}
+    if invalid_override_arms:
+        rospy.logwarn(
+            "initial_pose_delta_override.arms contains unsupported values "
+            f"{sorted(invalid_override_arms)}; only left/right/both are accepted."
+        )
+        initial_pose_override_arms -= invalid_override_arms
+    if initial_pose_override_enabled and not initial_pose_override_arms:
+        rospy.logwarn(
+            "initial_pose_delta_override is enabled but arms is empty; disabling the override."
+        )
+        initial_pose_override_enabled = False
+    initial_pose_override_left = initial_pose_override_enabled and 'left' in initial_pose_override_arms
+    initial_pose_override_right = initial_pose_override_enabled and 'right' in initial_pose_override_arms
+    initial_pose_override_include_gripper = bool(initial_pose_override_cfg.get('include_gripper', False))
+    terminal_filter_cfg = cfg['ros'].get('chunk_terminal_displacement_filter', {})
+    terminal_filter_enabled = bool(terminal_filter_cfg.get('enabled', False))
+    terminal_filter_left_threshold = np.asarray(
+        terminal_filter_cfg.get('left_threshold', [0.0] * 7), dtype=np.float32,
+    )
+    terminal_filter_right_threshold = np.asarray(
+        terminal_filter_cfg.get('right_threshold', [0.0] * 7), dtype=np.float32,
+    )
+    if terminal_filter_left_threshold.shape != (7,) or terminal_filter_right_threshold.shape != (7,):
+        rospy.logwarn(
+            "chunk_terminal_displacement_filter left_threshold/right_threshold must each contain 7 values; "
+            "disabling the filter."
+        )
+        terminal_filter_enabled = False
     gripper_threshold_cfg = cfg['ros'].get('gripper_threshold', cfg['ros'].get('gripper_binary', {}))
     gripper_threshold_enabled = bool(gripper_threshold_cfg.get('enabled', False))
+    gripper_delta_scale_cfg = cfg['ros'].get('gripper_delta_scale', {})
+    gripper_delta_scale_enabled = bool(gripper_delta_scale_cfg.get('enabled', False))
+    gripper_delta_gains = np.asarray([
+        max(float(gripper_delta_scale_cfg.get('left_gain', 1.0)), 0.0),
+        max(float(gripper_delta_scale_cfg.get('right_gain', 1.0)), 0.0),
+    ], dtype=np.float32)
+    gripper_delta_clip_min = gripper_delta_scale_cfg.get('clip_min')
+    gripper_delta_clip_max = gripper_delta_scale_cfg.get('clip_max')
+    if gripper_delta_clip_min is not None:
+        gripper_delta_clip_min = np.asarray(gripper_delta_clip_min, dtype=np.float32)
+    if gripper_delta_clip_max is not None:
+        gripper_delta_clip_max = np.asarray(gripper_delta_clip_max, dtype=np.float32)
+    if (
+        (gripper_delta_clip_min is not None and gripper_delta_clip_min.shape != (2,))
+        or (gripper_delta_clip_max is not None and gripper_delta_clip_max.shape != (2,))
+    ):
+        rospy.logwarn("gripper_delta_scale clip_min/clip_max must each contain [left, right]; disabling clipping.")
+        gripper_delta_clip_min = None
+        gripper_delta_clip_max = None
     policy_gripper_input_cfg = cfg['ros'].get('policy_gripper_input', {})
     policy_gripper_input_mode = str(policy_gripper_input_cfg.get('mode', 'measured')).lower()
     if policy_gripper_input_mode not in ('measured', 'commanded', 'hybrid'):
@@ -1729,6 +1894,52 @@ def main():
     chunk_smoothing_upsample = max(int(chunk_smoothing_cfg.get('upsample_factor', 2)), 1)
     chunk_smoothing_window = max(int(chunk_smoothing_cfg.get('window_length', 21)), 3)
     chunk_smoothing_polyorder = max(int(chunk_smoothing_cfg.get('polyorder', 3)), 0)
+    chunk_lowpass_cfg = cfg['ros'].get('action_chunk_lowpass', {})
+    chunk_lowpass_enabled = bool(chunk_lowpass_cfg.get('enabled', False))
+    chunk_lowpass_cutoff_hz = float(chunk_lowpass_cfg.get('cutoff_hz', 1.2))
+    chunk_lowpass_sample_rate_hz = float(
+        chunk_lowpass_cfg.get('sample_rate_hz', rate_hz)
+    )
+    chunk_lowpass_order = max(int(chunk_lowpass_cfg.get('order', 4)), 1)
+    chunk_lowpass_preserve_endpoints = bool(
+        chunk_lowpass_cfg.get('preserve_endpoints', True)
+    )
+    chunk_lowpass_include_gripper = bool(
+        chunk_lowpass_cfg.get('include_gripper', False)
+    )
+    if chunk_lowpass_enabled and not (
+        0.0 < chunk_lowpass_cutoff_hz < 0.5 * chunk_lowpass_sample_rate_hz
+    ):
+        raise ValueError(
+            "action_chunk_lowpass.cutoff_hz must be between 0 and "
+            f"{0.5 * chunk_lowpass_sample_rate_hz:.6g} Hz"
+        )
+    chunk_monotonic_cfg = cfg['ros'].get('action_chunk_monotonic', {})
+    chunk_monotonic_enabled = bool(chunk_monotonic_cfg.get('enabled', False))
+    chunk_monotonic_arms_cfg = chunk_monotonic_cfg.get('arms', ['left', 'right'])
+    if isinstance(chunk_monotonic_arms_cfg, str):
+        chunk_monotonic_arms_cfg = [chunk_monotonic_arms_cfg]
+    chunk_monotonic_arms = {
+        str(arm).strip().lower() for arm in chunk_monotonic_arms_cfg
+    }
+    if 'both' in chunk_monotonic_arms:
+        chunk_monotonic_arms.update(('left', 'right'))
+        chunk_monotonic_arms.discard('both')
+    invalid_monotonic_arms = chunk_monotonic_arms - {'left', 'right'}
+    if invalid_monotonic_arms:
+        raise ValueError(
+            "action_chunk_monotonic.arms only accepts left/right/both; got "
+            f"{sorted(invalid_monotonic_arms)}"
+        )
+    chunk_monotonic_strength = float(chunk_monotonic_cfg.get('strength', 1.0))
+    if not 0.0 <= chunk_monotonic_strength <= 1.0:
+        raise ValueError("action_chunk_monotonic.strength must be in [0, 1]")
+    chunk_monotonic_min_terminal_delta = max(
+        float(chunk_monotonic_cfg.get('min_terminal_delta', 1e-4)), 0.0
+    )
+    chunk_monotonic_include_gripper = bool(
+        chunk_monotonic_cfg.get('include_gripper', False)
+    )
     temporal_ensemble_cfg = cfg['ros'].get('temporal_ensemble', {})
     temporal_ensemble_enabled = bool(temporal_ensemble_cfg.get('enabled', False))
     temporal_exp_decay = float(temporal_ensemble_cfg.get('exp_decay', 0.7))
@@ -1812,14 +2023,24 @@ def main():
     # Home positioning before policy loop
     name_list = cfg['ros'].get('joint_names', [f'joint{i}' for i in range(7)])
     eef_ik = None
+    last_published_ik = {}
+    last_ik_publish_time = None
     if eef_action_mode:
         eef_ik_cfg = cfg['ros'].get('eef_ik', {})
         if not bool(eef_ik_cfg.get('enabled', True)):
             raise ValueError("ros.action_mode='eef_absolute' now requires ros.eef_ik.enabled=true")
-        eef_ik = PiperNumericalIK(eef_ik_cfg)
+        eef_ik = PiperNumericalIK(eef_ik_cfg, loginfo=rospy.loginfo)
+        if eef_ik.differential is not None:
+            if abs(eef_ik.differential.period - 1.0 / rate_hz) > 1e-6:
+                raise ValueError("differential.control_period_sec must equal 1 / ros.rate_hz")
+            rospy.loginfo(
+                "Differential IK: bounded incremental tracking; pose residuals indicate "
+                "target accuracy, not automatic rejection; "
+                f"vmax={eef_ik.differential.vmax.tolist()} rad/s "
+                f"amax={eef_ik.differential.amax.tolist()} rad/s^2")
         rospy.loginfo(
             "EEF IK configured: "
-            f"urdf={eef_ik.urdf_path} base={eef_ik.base_link} tip={eef_ik.tip_link} "
+            f"solver={eef_ik.solver} urdf={eef_ik.urdf_path} base={eef_ik.base_link} tip={eef_ik.tip_link} "
             f"max_pos_err={eef_ik.max_position_error_m:.4f}m "
             f"max_rot_err={eef_ik.max_orientation_error_rad:.4f}rad"
         )
@@ -1854,8 +2075,12 @@ def main():
             if start_time is not None and start_left is not None and target_left is not None:
                 elapsed = time.monotonic() - start_time
                 alpha = 1.0 if duration <= 0.0 else min(max(elapsed / duration, 0.0), 1.0)
-                publish_left = start_left + alpha * (target_left - start_left)
-                publish_right = start_right + alpha * (target_right - start_right)
+                publish_left = interpolate_arm_command_keep_gripper(
+                    start_left, target_left, alpha
+                )
+                publish_right = interpolate_arm_command_keep_gripper(
+                    start_right, target_right, alpha
+                )
 
                 js = JointState()
                 js.header.stamp = rospy.Time.now()
@@ -1957,6 +2182,13 @@ def main():
                 "Command delta deadband enabled: "
                 f"left={deadband_left.tolist()} right={deadband_right.tolist()}"
             )
+    gripper_hysteresis_cfg = cfg['ros'].get('gripper_hysteresis', {})
+    gripper_hysteresis = (GripperHysteresis(gripper_hysteresis_cfg)
+                          if gripper_hysteresis_cfg.get('enabled', False) else None)
+    if gripper_hysteresis is not None and gripper_threshold_enabled:
+        raise ValueError('gripper_hysteresis and gripper_threshold cannot both be enabled')
+    if gripper_hysteresis is not None and command_publish_mode != 'direct':
+        raise ValueError('gripper_hysteresis requires direct command publishing')
     gripper_close_thresholds = np.asarray(gripper_threshold_cfg.get('close_threshold', [0.004, 0.004]), dtype=np.float32)
     gripper_open_thresholds = np.asarray(gripper_threshold_cfg.get('open_threshold', [0.020, 0.020]), dtype=np.float32)
     gripper_close_values = np.asarray(gripper_threshold_cfg.get('close_value', [-0.0037, -0.0033]), dtype=np.float32)
@@ -1987,6 +2219,14 @@ def main():
                 f"close_value={gripper_close_values.tolist()} "
                 f"open_value={gripper_open_values.tolist()}"
             )
+    if gripper_delta_scale_enabled:
+        rospy.loginfo(
+            "Gripper delta scaling enabled: "
+            f"left_gain={gripper_delta_gains[0]:.3f} "
+            f"right_gain={gripper_delta_gains[1]:.3f} "
+            f"clip_min={None if gripper_delta_clip_min is None else gripper_delta_clip_min.tolist()} "
+            f"clip_max={None if gripper_delta_clip_max is None else gripper_delta_clip_max.tolist()}"
+        )
     if action_filter_enabled:
         deadband = np.asarray(action_filter_cfg.get('deadband', [0.0] * len(name_list)), dtype=np.float32)
         if deadband.shape[0] != len(name_list):
@@ -2004,6 +2244,24 @@ def main():
             f"cubic_upsample={chunk_smoothing_upsample}x "
             f"savgol_window={chunk_smoothing_window} "
             f"polyorder={chunk_smoothing_polyorder}"
+        )
+    if terminal_filter_enabled:
+        rospy.loginfo(
+            "Chunk terminal displacement filter enabled: "
+            f"left_threshold={terminal_filter_left_threshold.tolist()} "
+            f"right_threshold={terminal_filter_right_threshold.tolist()}"
+        )
+    if first_action_delta_scale_enabled:
+        rospy.loginfo(
+            "First consumed action delta scaling enabled: "
+            f"coefficient={first_action_delta_scale_coefficient:.3f} "
+            f"include_gripper={first_action_delta_scale_include_gripper}"
+        )
+    if initial_pose_override_enabled:
+        rospy.loginfo(
+            "Initial-pose delta override enabled: "
+            f"arms={sorted(initial_pose_override_arms)} "
+            f"include_gripper={initial_pose_override_include_gripper}"
         )
     if temporal_ensemble_enabled:
         rospy.loginfo(
@@ -2066,6 +2324,7 @@ def main():
                     max(int(home_cfg.get('rate_hz', rate_hz)), 1),
                     mode=str(home_cfg.get('mode', 'step')).lower(),
                     num_steps=home_cfg.get('num_steps'),
+                    gripper_move_start_fraction=home_cfg.get('gripper_move_start_fraction'),
                     settle=bool(home_cfg.get('settle', True)),
                     settle_tolerance=float(home_cfg.get('settle_tolerance', 0.04)),
                     settle_hold_sec=float(home_cfg.get('settle_hold_sec', 0.5)),
@@ -2203,6 +2462,7 @@ def main():
 
         header = {
             'task_prompt': pkt['task_prompt'],
+            'episode_start': request_id == 0,
             'jleft': policy_left.tolist(),
             'jright': policy_right.tolist(),
             'control_hz': rate_hz,
@@ -2217,8 +2477,6 @@ def main():
             header['current_eef_left'] = pkt['current_eef_left']
         if pkt.get('current_eef_right') is not None:
             header['current_eef_right'] = pkt['current_eef_right']
-        if pkt.get('hy_eef_state_wxyz') is not None:
-            header['hy_eef_state_wxyz'] = pkt['hy_eef_state_wxyz']
         if use_base and pkt['odom'] is not None:
             header['odom'] = pkt['odom']
 
@@ -2356,6 +2614,72 @@ def main():
             return
         received_left_mat = left_mat.copy()
         received_right_mat = right_mat.copy()
+        if chunk_lowpass_enabled:
+            try:
+                left_mat, right_mat = lowpass_dual_action_chunks_zero_phase(
+                    left_mat,
+                    right_mat,
+                    sample_rate_hz=chunk_lowpass_sample_rate_hz,
+                    cutoff_hz=chunk_lowpass_cutoff_hz,
+                    order=chunk_lowpass_order,
+                    preserve_endpoints=chunk_lowpass_preserve_endpoints,
+                    include_gripper=chunk_lowpass_include_gripper,
+                )
+            except ValueError as exc:
+                rospy.logwarn(f"Chunk low-pass skipped: {exc}")
+                return
+            lowpass_delta = np.concatenate(
+                (left_mat[:, :-1] - received_left_mat[:, :-1],
+                 right_mat[:, :-1] - received_right_mat[:, :-1]),
+                axis=1,
+            )
+            rospy.loginfo(
+                "Filtered chunk-wide high-frequency motion: "
+                f"cutoff_hz={chunk_lowpass_cutoff_hz:.3f} "
+                f"sample_rate_hz={chunk_lowpass_sample_rate_hz:.3f} "
+                f"order={chunk_lowpass_order} "
+                f"rms_delta={float(np.sqrt(np.mean(lowpass_delta ** 2))):.6f} "
+                f"max_delta={float(np.max(np.abs(lowpass_delta))):.6f}"
+            )
+        lowpass_left_mat = left_mat.copy()
+        lowpass_right_mat = right_mat.copy()
+        if chunk_monotonic_enabled:
+            monotonic_before_left = left_mat.copy()
+            monotonic_before_right = right_mat.copy()
+            try:
+                if 'left' in chunk_monotonic_arms:
+                    left_mat = project_action_chunk_monotonic_to_endpoint(
+                        left_mat,
+                        command_left,
+                        strength=chunk_monotonic_strength,
+                        min_terminal_delta=chunk_monotonic_min_terminal_delta,
+                        include_gripper=chunk_monotonic_include_gripper,
+                    )
+                if 'right' in chunk_monotonic_arms:
+                    right_mat = project_action_chunk_monotonic_to_endpoint(
+                        right_mat,
+                        command_right,
+                        strength=chunk_monotonic_strength,
+                        min_terminal_delta=chunk_monotonic_min_terminal_delta,
+                        include_gripper=chunk_monotonic_include_gripper,
+                    )
+            except ValueError as exc:
+                rospy.logwarn(f"Chunk monotonic projection skipped: {exc}")
+                return
+            monotonic_delta = np.concatenate(
+                (left_mat[:, :-1] - monotonic_before_left[:, :-1],
+                 right_mat[:, :-1] - monotonic_before_right[:, :-1]),
+                axis=1,
+            )
+            rospy.loginfo(
+                "Suppressed chunk-internal joint reversals: "
+                f"arms={sorted(chunk_monotonic_arms)} "
+                f"strength={chunk_monotonic_strength:.3f} "
+                f"rms_delta={float(np.sqrt(np.mean(monotonic_delta ** 2))):.6f} "
+                f"max_delta={float(np.max(np.abs(monotonic_delta))):.6f}"
+            )
+        monotonic_left_mat = left_mat.copy()
+        monotonic_right_mat = right_mat.copy()
         if chunk_smoothing_enabled:
             left_mat, right_mat = smooth_dual_action_chunks_savgol(
                 left_mat,
@@ -2402,6 +2726,8 @@ def main():
                 rospy.logwarn("Policy response header has_model_raw_action=true but raw action frames are missing.")
 
         request_temporal_overlap_steps = temporal_overlap_steps
+        initial_bridge_factor = 1
+        initial_bridge_added_steps = 0
         if interpolation_enabled and interpolation_mode == 'adaptive_delta':
             try:
                 left_mat, right_mat, source_to_expanded, segment_factors = adaptive_delta_upsample_chunks(
@@ -2419,7 +2745,7 @@ def main():
             if adaptive_bridge_enabled:
                 try:
                     left_before_bridge = left_mat.shape[0]
-                    left_mat, right_mat, source_to_expanded, _ = adaptive_bridge_to_first_action(
+                    left_mat, right_mat, source_to_expanded, initial_bridge_factor = adaptive_bridge_to_first_action(
                         left_mat,
                         right_mat,
                         command_left,
@@ -2435,6 +2761,15 @@ def main():
                             np.repeat(vel_mat[:1], bridge_count, axis=0),
                             vel_mat,
                         ])
+                    initial_bridge_added_steps = (
+                        left_mat.shape[0] - left_before_bridge
+                    )
+                    if initial_bridge_added_steps > 0:
+                        rospy.loginfo(
+                            "Inserted chunk-boundary bridge: "
+                            f"factor={initial_bridge_factor} "
+                            f"added_steps={initial_bridge_added_steps}"
+                        )
                 except ValueError as exc:
                     rospy.logwarn(str(exc))
                     return
@@ -2459,6 +2794,42 @@ def main():
                 chunk_size = int(left_mat.shape[0])
             steps_to_execute = chunk_size if open_loop_steps is None else min(open_loop_steps, chunk_size)
 
+        terminal_delta_left = np.zeros(left_mat.shape[1], dtype=np.float32)
+        terminal_delta_right = np.zeros(right_mat.shape[1], dtype=np.float32)
+        terminal_cancel_left = np.zeros(left_mat.shape[1], dtype=bool)
+        terminal_cancel_right = np.zeros(right_mat.shape[1], dtype=bool)
+        terminal_endpoint_index = min(max(int(steps_to_execute), 1), chunk_size) - 1
+        if terminal_filter_enabled:
+            initial_left = pending_snapshot.get('measured_current_left', pending_snapshot['current_left'])
+            initial_right = pending_snapshot.get('measured_current_right', pending_snapshot['current_right'])
+            try:
+                (
+                    left_mat,
+                    right_mat,
+                    terminal_delta_left,
+                    terminal_delta_right,
+                    terminal_cancel_left,
+                    terminal_cancel_right,
+                    terminal_endpoint_index,
+                ) = filter_chunk_by_terminal_displacement(
+                    left_mat,
+                    right_mat,
+                    initial_left,
+                    initial_right,
+                    steps_to_execute,
+                    terminal_filter_left_threshold,
+                    terminal_filter_right_threshold,
+                )
+            except ValueError as exc:
+                rospy.logwarn(f"Chunk terminal displacement filter skipped: {exc}")
+            else:
+                rospy.loginfo(
+                    "Chunk terminal displacement filter: "
+                    f"endpoint_index={terminal_endpoint_index} "
+                    f"left_cancelled={np.flatnonzero(terminal_cancel_left).tolist()} "
+                    f"right_cancelled={np.flatnonzero(terminal_cancel_right).tolist()}"
+                )
+
         action_skip_steps = min(chunk_action_skip_steps, max(chunk_size - 1, 0))
         if action_skip_steps > 0:
             global_action_step = max(global_action_step, policy_request_step + action_skip_steps)
@@ -2482,6 +2853,33 @@ def main():
             'executed_steps': 0,
             'received_chunk_size': received_chunk_size,
             'steps_to_execute': steps_to_execute,
+            'terminal_filter_enabled': terminal_filter_enabled,
+            'terminal_endpoint_index': terminal_endpoint_index,
+            'terminal_delta_left': terminal_delta_left.copy(),
+            'terminal_delta_right': terminal_delta_right.copy(),
+            'terminal_cancel_left': terminal_cancel_left.copy(),
+            'terminal_cancel_right': terminal_cancel_right.copy(),
+            'first_action_delta_scale_enabled': first_action_delta_scale_enabled,
+            'first_action_delta_scale_coefficient': first_action_delta_scale_coefficient,
+            'first_action_delta_scale_include_gripper': first_action_delta_scale_include_gripper,
+            'initial_bridge_factor': initial_bridge_factor,
+            'initial_bridge_added_steps': initial_bridge_added_steps,
+            'chunk_lowpass_enabled': chunk_lowpass_enabled,
+            'chunk_lowpass_cutoff_hz': chunk_lowpass_cutoff_hz,
+            'chunk_lowpass_sample_rate_hz': chunk_lowpass_sample_rate_hz,
+            'chunk_lowpass_order': chunk_lowpass_order,
+            'chunk_lowpass_preserve_endpoints': chunk_lowpass_preserve_endpoints,
+            'lowpass_left': lowpass_left_mat.copy(),
+            'lowpass_right': lowpass_right_mat.copy(),
+            'chunk_monotonic_enabled': chunk_monotonic_enabled,
+            'chunk_monotonic_arms': sorted(chunk_monotonic_arms),
+            'chunk_monotonic_strength': chunk_monotonic_strength,
+            'chunk_monotonic_min_terminal_delta': chunk_monotonic_min_terminal_delta,
+            'monotonic_left': monotonic_left_mat.copy(),
+            'monotonic_right': monotonic_right_mat.copy(),
+            'initial_pose_delta_override_enabled': initial_pose_override_enabled,
+            'initial_pose_delta_override_arms': sorted(initial_pose_override_arms),
+            'initial_pose_delta_override_include_gripper': initial_pose_override_include_gripper,
             'action_skip_steps': action_skip_steps,
             'policy_latency_sec': policy_latency_sec,
             'policy_latency_steps': policy_latency_steps,
@@ -2520,7 +2918,7 @@ def main():
         nonlocal integrated_left, integrated_right
         nonlocal last_command_left, last_command_right
         nonlocal global_action_step, chunk_history
-        nonlocal last_stale_joint_warn
+        nonlocal last_stale_joint_warn, gripper_hysteresis, last_ik_publish_time
 
         current_chunk_start_step = active_chunk['start_step']
         chunk_size = int(active_chunk['left'].shape[0])
@@ -2661,6 +3059,28 @@ def main():
         clipped_target_left = target_left.copy()
         clipped_target_right = target_right.copy()
 
+        if gripper_delta_scale_enabled:
+            target_left, target_right = scale_gripper_deltas(
+                target_left,
+                target_right,
+                active_chunk.get('request_measured_left', active_chunk['request_current_left']),
+                active_chunk.get('request_measured_right', active_chunk['request_current_right']),
+                gripper_delta_gains,
+                clip_min=gripper_delta_clip_min,
+                clip_max=gripper_delta_clip_max,
+            )
+        gripper_candidate = gripper_hysteresis
+        gripper_transition = None
+        if gripper_hysteresis is not None:
+            values, gripper_candidate, gripper_transition = gripper_hysteresis.propose(
+                [target_left[-1], target_right[-1]],
+                [ik_seed_left[-1], ik_seed_right[-1]],
+                request_opening=[active_chunk['request_current_left'][-1],
+                                 active_chunk['request_current_right'][-1]],
+            )
+            target_left = target_left.copy()
+            target_right = target_right.copy()
+            target_left[-1], target_right[-1] = values
         if gripper_threshold_enabled:
             target_left, target_right = threshold_gripper_targets(
                 target_left,
@@ -2685,6 +3105,31 @@ def main():
             command_delta_deadband_residual_left = np.zeros_like(target_left, dtype=np.float32)
             command_delta_deadband_residual_right = np.zeros_like(target_right, dtype=np.float32)
 
+        first_action_delta_scale_applied = (
+            first_action_delta_scale_enabled
+            and active_chunk['executed_steps'] == 0
+        )
+        if first_action_delta_scale_applied:
+            target_left, target_right = scale_action_delta_from_reference(
+                target_left,
+                target_right,
+                command_left_before,
+                command_right_before,
+                first_action_delta_scale_coefficient,
+                include_gripper=first_action_delta_scale_include_gripper,
+            )
+
+        if initial_pose_override_enabled:
+            target_left, target_right = override_arm_delta_from_initial_pose(
+                target_left,
+                target_right,
+                active_chunk.get('request_measured_left', active_chunk['request_current_left']),
+                active_chunk.get('request_measured_right', active_chunk['request_current_right']),
+                initial_pose_override_left,
+                initial_pose_override_right,
+                include_gripper=initial_pose_override_include_gripper,
+            )
+
         raw_delta_left = raw_target_left - command_left_before
         raw_delta_right = raw_target_right - command_right_before
         applied_delta_left = target_left - command_left_before
@@ -2697,11 +3142,6 @@ def main():
         tracking_error_after_right = target_right - publish_current_right
         clip_residual_left = raw_target_left - clipped_target_left
         clip_residual_right = raw_target_right - clipped_target_right
-
-        command_left = target_left.copy()
-        command_right = target_right.copy()
-        last_command_left = command_left.copy()
-        last_command_right = command_right.copy()
 
         ik_joint_left = None
         ik_joint_right = None
@@ -2717,23 +3157,59 @@ def main():
                     eef_ik.calibrate('left', ik_seed_left, command_left_before)
                 if 'right' not in eef_ik.calibration:
                     eef_ik.calibrate('right', ik_seed_right, command_right_before)
+                ik_elapsed = (1.0 / rate_hz if last_ik_publish_time is None
+                              else max(time.monotonic() - last_ik_publish_time, 1e-6))
                 try:
-                    ik_left_result = eef_ik.solve('left', target_left, ik_seed_left)
-                    ik_right_result = eef_ik.solve('right', target_right, ik_seed_right)
+                    ik_left_result = eef_ik.solve('left', target_left, ik_seed_left, last_published_ik.get('left'), dt=ik_elapsed)
+                    ik_right_result = eef_ik.solve('right', target_right, ik_seed_right, last_published_ik.get('right'), dt=ik_elapsed)
                 except Exception as exc:  # noqa: BLE001
                     rospy.logwarn_throttle(1.0, f"EEF IK solve failed; skipping command publish: {exc}")
                     return False
                 if (not ik_left_result['acceptable'] or not ik_right_result['acceptable']) and not eef_ik.publish_on_failure:
+                    if action_logger is not None:
+                        rejection = {
+                            'wall_time': time.time(), 'request_id': active_chunk['request_id'],
+                            'action_index': action_index, 'global_action_step': global_action_step,
+                            'target_left': target_left.tolist(), 'target_right': target_right.tolist(),
+                            'seed_left': ik_seed_left.tolist(), 'seed_right': ik_seed_right.tolist(),
+                            'left': {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                                     for k, v in ik_left_result.items()},
+                            'right': {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                                      for k, v in ik_right_result.items()},
+                        }
+                        try:
+                            with open(action_logger['path'] + '.rejected.jsonl', 'a', encoding='utf-8') as f:
+                                f.write(json.dumps(rejection) + '\n')
+                        except OSError as exc:
+                            rospy.logwarn_throttle(1.0, f"Cannot record rejected IK command: {exc}")
                     rospy.logwarn_throttle(
                         1.0,
-                        "EEF IK residual too large; skipping command publish: "
+                        "EEF IK command rejected (pose/joint/singularity/hold constraints); skipping publish: "
                         f"left_pos={ik_left_result['position_error_m']:.4f}m "
                         f"left_rot={ik_left_result['orientation_error_rad']:.4f}rad "
                         f"right_pos={ik_right_result['position_error_m']:.4f}m "
-                        f"right_rot={ik_right_result['orientation_error_rad']:.4f}rad"
+                        f"right_rot={ik_right_result['orientation_error_rad']:.4f}rad "
+                        f"left_solution_pos={ik_left_result['solution_position_error_m']:.4f}m "
+                        f"right_solution_pos={ik_right_result['solution_position_error_m']:.4f}m "
+                        f"joint_delta_limited={ik_left_result['joint_delta_limited']}/{ik_right_result['joint_delta_limited']} "
+                        f"wrist_guard_left={ik_left_result.get('wrist_singularity_avoidance', {})} "
+                        f"wrist_guard_right={ik_right_result.get('wrist_singularity_avoidance', {})}"
                     )
                     return False
-                if ik_left_result.get('joint_delta_limited') or ik_right_result.get('joint_delta_limited'):
+                if eef_ik.differential is not None:
+                    for arm_name, result in (('left', ik_left_result), ('right', ik_right_result)):
+                        limits = result['differential_ik']['active_limits']
+                        if any(limits.values()):
+                            message = (
+                                f"EEF IK bounded tracking {arm_name}: active_limits={limits} "
+                                f"target_reached={result['target_reached']} "
+                                f"position_error={result['position_error_m']:.4f}m "
+                                f"orientation_error={result['orientation_error_rad']:.4f}rad")
+                            if result['target_reached']:
+                                rospy.loginfo_throttle(1.0, message)
+                            else:
+                                rospy.logwarn_throttle(1.0, message)
+                elif ik_left_result.get('joint_delta_limited') or ik_right_result.get('joint_delta_limited'):
                     rospy.logwarn_throttle(
                         1.0,
                         "EEF IK joint delta limited: "
@@ -2744,7 +3220,36 @@ def main():
                     )
                 ik_joint_left = ik_left_result['joints']
                 ik_joint_right = ik_right_result['joints']
+                for arm_index, (arm_name, result, target) in enumerate((
+                    ('left', ik_left_result, target_left), ('right', ik_right_result, target_right),
+                )):
+                    if result.get('differential_ik', {}).get('mode') == 'stalled':
+                        rospy.logwarn_throttle(
+                            1.0, f"Differential IK stalled on {arm_name}: "
+                            f"position error={result['position_error_m']:.4f}m "
+                            f"orientation error={result['orientation_error_rad']:.4f}rad")
+                    if result.get('wrist_singularity_avoidance', {}).get('mode') == 'hold_last_safe':
+                        rospy.logwarn_throttle(
+                            1.0, f"Holding {arm_name} at last safe joint command: "
+                            f"model target not reached; position error={result['position_error_m']:.4f}m "
+                            f"orientation error={result['orientation_error_rad']:.4f}rad")
+                        target[-1] = result['joints'][-1]
+                        if gripper_candidate is not None:
+                            # The guard holds the previously sent gripper too;
+                            # do not commit a transition that was not published.
+                            fraction = ((target[-1] - gripper_candidate.closed[arm_index]) /
+                                        (gripper_candidate.opened[arm_index] - gripper_candidate.closed[arm_index]))
+                            gripper_candidate.is_open[arm_index] = fraction >= 0.5
+                            gripper_candidate.count[arm_index] = 0
+                            gripper_transition['output_open'][arm_index] = bool(fraction >= 0.5)
+                            gripper_transition['switched'][arm_index] = False
+                            gripper_transition['pending_count'][arm_index] = 0
                 publish_joint_pair(pub_l, pub_r, name_list, ik_joint_left, ik_joint_right)
+                last_ik_publish_time = time.monotonic()
+                eef_ik.commit('left', ik_left_result)
+                eef_ik.commit('right', ik_right_result)
+                last_published_ik['left'] = ik_joint_left.copy()
+                last_published_ik['right'] = ik_joint_right.copy()
                 if not published_first_command:
                     rospy.loginfo(
                         f"Published first IK joint command to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
@@ -2771,6 +3276,12 @@ def main():
                 command_publish_state['start_right'] = command_right_before.copy()
                 command_publish_state['target_left'] = target_left.copy()
                 command_publish_state['target_right'] = target_right.copy()
+
+        gripper_hysteresis = gripper_candidate
+        command_left = target_left.copy()
+        command_right = target_right.copy()
+        last_command_left = command_left.copy()
+        last_command_right = command_right.copy()
 
         vel_mat = active_chunk['vel']
         if use_base and vel_mat is not None and pub_v is not None:
@@ -2821,6 +3332,13 @@ def main():
             'delta_clip_enabled': delta_clip_enabled,
             'delta_clip_reference': delta_clip_reference,
             'command_delta_deadband_enabled': command_delta_deadband_enabled,
+            'first_action_delta_scale_enabled': first_action_delta_scale_enabled,
+            'first_action_delta_scale_coefficient': f'{first_action_delta_scale_coefficient:.6f}',
+            'first_action_delta_scale_include_gripper': first_action_delta_scale_include_gripper,
+            'first_action_delta_scale_applied': first_action_delta_scale_applied,
+            'initial_pose_delta_override_enabled': initial_pose_override_enabled,
+            'initial_pose_delta_override_arms': json.dumps(sorted(initial_pose_override_arms), separators=(',', ':')),
+            'initial_pose_delta_override_include_gripper': initial_pose_override_include_gripper,
             'temporal_ensemble_count': temporal_ensemble_count,
             'temporal_ensemble_weights': vector_to_json(temporal_ensemble_weights),
             'current_left': vector_to_json(active_chunk['request_current_left']),
@@ -2841,6 +3359,10 @@ def main():
             'filtered_right': vector_to_json(filtered_target_right),
             'target_left': vector_to_json(target_left),
             'target_right': vector_to_json(target_right),
+            'ik_seed_joint_left': vector_to_json(ik_seed_left) if eef_action_mode else '',
+            'ik_seed_joint_right': vector_to_json(ik_seed_right) if eef_action_mode else '',
+            'ik_diagnostics_left': '' if ik_left_result is None else json.dumps({k: v for k, v in ik_left_result.items() if k != 'joints'}, separators=(',', ':')),
+            'ik_diagnostics_right': '' if ik_right_result is None else json.dumps({k: v for k, v in ik_right_result.items() if k != 'joints'}, separators=(',', ':')),
             'ik_joint_left': vector_to_json(ik_joint_left),
             'ik_joint_right': vector_to_json(ik_joint_right),
             'ik_left_position_error_m': '' if ik_left_result is None else f"{ik_left_result['position_error_m']:.6f}",
@@ -2896,6 +3418,7 @@ def main():
             'right_gripper_raw': f'{float(raw_target_right[-1]):.6f}',
             'right_gripper_ensembled': f'{float(ensembled_target_right[-1]):.6f}',
             'right_gripper_target': f'{float(target_right[-1]):.6f}',
+            'gripper_hysteresis': json.dumps(gripper_transition),
             'base_vel': vector_to_json(base_vel),
         })
 

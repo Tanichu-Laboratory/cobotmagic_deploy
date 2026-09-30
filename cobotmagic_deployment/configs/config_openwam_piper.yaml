@@ -1,0 +1,172 @@
+# OpenWAM Alpha, RoboDojo REAL dual Piper (not Piper-X or simulation).
+policy_backend: openwam
+task_prompt: "put the cube into the box"
+openwam:
+  repo_path: /workspace/project/OpenWAM
+  checkpoint_path: /workspace/project/OpenWAM/assets/openwam_ckpt/openwam_alpha/OpenWAM-Alpha-Real-RoboDojo-Piper
+  checkpoint_name: checkpoint_step_30000.safetensors
+  # checkpoint_path: /workspace/dataset/checkpoints/gm100_openwam_step96000
+  # checkpoint_name: checkpoint_step_96000.safetensors
+  device: cuda:0
+  denoise_steps: 10
+  compile: false
+  warmup: true
+  gripper:
+    # User-provided endpoints; confirm measured travel on the physical robot.
+    sensor_tolerance: 0.005  # Physical gripper units; permits measured closed-end undershoot.
+    closed: [0.0, 0.0]
+    open: [0.06558, 0.06558]
+    # No output gain: bridge hysteresis consumes the original normalized opening.
+    # Measured input normalization still uses the physical endpoints above.
+    action_open_normalized: 1.0
+
+ros:
+  image_type: raw
+  jpeg_quality: 95
+  # Initial commissioning rate; model throughput is measured separately.
+  rate_hz: 5
+  policy_response_timeout_sec: 120.0
+  max_joint_age_sec: 0.75
+  max_image_age_sec: 2.0
+  action_mode: eef_absolute
+  initial_action_skip_steps: 0
+  open_loop_steps: 32  # Bridge-only execution limit; server always sends the full model chunk.
+  policy_request:
+    when_live_chunk: wait
+  chunk_interpolation:
+    enabled: false
+  delta_clip:
+    enabled: false  # Feed model EEF targets directly to IK; no pre-IK delta clipping.
+  gripper_threshold:
+    enabled: false
+  gripper_hysteresis:
+    enabled: true
+    # Original model [0,1] opening, without the former /0.75 gain.
+    # Mid-band retains the previous state; confirm two published steps.
+    # GM100 closed-home run 20260924_063643: left opening plateau ~0.58-0.66,
+    # closed/idle output ~0.00-0.08. Preserve a dead band and two-step confirmation.
+    # Previous open-home thresholds: close [0.80, 0.75], open [0.86, 0.82].
+    close_threshold_normalized: [0.45, 0.45]
+    open_threshold_normalized: [0.55, 0.55]
+    # Thresholds follow the observation used for inference, fixed within a chunk.
+    # Closed request: 0.45/0.55; fully open request: 0.82/0.90.
+    request_relative:
+      enabled: true
+      close_margin_normalized: 0.18
+      open_margin_normalized: 0.15
+      max_close_threshold_normalized: 0.82
+      max_open_threshold_normalized: 0.90
+    confirm_steps: 2
+    closed: [0.0, 0.0]
+    open: [0.06558, 0.06558]
+  policy_gripper_input:
+    mode: measured
+  command_publish:
+    mode: direct
+    rate_hz: 5
+    interpolation: linear
+  eef_ik:
+    enabled: true
+    solver: differential
+    differential:
+      control_period_sec: 0.2
+      max_velocity_rad_s: [0.6, 0.6, 0.6, 0.8, 0.8, 0.8]
+      max_acceleration_rad_s2: [3.0, 3.0, 3.0, 4.0, 4.0, 4.0]
+      iterations: 8
+      singular_value_soft: 0.025
+      singular_damping: 0.02
+      rotation_scale_m: 0.15
+      position_tolerance_m: 0.003
+      orientation_tolerance_rad: 0.14
+    # Verified against 21 paired joint/EEF observations for this local URDF.
+    # ROS joint indices 3 and 5 have opposite signs to the URDF coordinates.
+    joint_signs: [1, 1, 1, -1, 1, -1]
+    # end_pose uses the same arm base; link6 -> EEF is a moving tool offset.
+    calibration_mode: tool
+    # Local correction: joint5 (ROS index 4) fixed origin pitch -5 deg -> 0 deg.
+    urdf_path: /workspace/cobotmagic_deploy/cobotmagic_deployment/assets/piper_description_cobotmagic_joint5_pitch0.urdf
+    base_link: base_link
+    tip_link: link6
+    max_iters: 80
+    tolerance: 0.0001
+    position_weight: 1.0
+    orientation_weight: 0.25
+    # Legacy absolute IK settings below; differential uses its own accuracy
+    # tolerances above and does not reject bounded progress for pose residual.
+    max_position_error_m: 0.04
+    max_orientation_error_rad: 0.8
+    # Legacy least_squares full-solution acceptance.
+    solution_max_position_error_m: 0.005
+    solution_max_orientation_error_rad: 0.05
+    joint_regularization_weight: 0.0
+    # Hard command bounds relative to measured joints (radians), enforced
+    # inside the differential solve as well as its velocity/acceleration bounds.
+    # Relaxed 1.5x: J1-3 about 10.3 degrees, J4-6 about 13.8 degrees.
+    max_joint_delta_rad: [0.18, 0.18, 0.18, 0.24, 0.24, 0.24]
+    clip_to_max_joint_delta: true
+    publish_on_failure: false
+    wrist_singularity_avoidance:
+      enabled: false
+      trigger_condition: 35.0  # Whole-arm weighted geometric Jacobian
+      max_condition: 40.0
+      max_command_delta_rad: 0.10  # All six joints, relative to last publish
+      trigger_rad: 0.2617993878  # 15 degrees; both arms, no idle-arm classifier
+      min_bend_rad: 0.1047197551  # 6 degrees; never cross the current wrist branch
+      preferred_bend_rad: 0.2094395102  # 12 degrees
+      max_position_error_m: 0.003
+      max_orientation_error_rad: 0.1396263402  # 8 degrees, near singularities only
+      max_wrist_command_delta_rad: 0.10  # previous PUBLISHED q[3]/q[5]
+  action_filter:
+    enabled: false
+  temporal_ensemble:
+    enabled: false
+  action_log:
+    enabled: true
+    dir: logs/action_commands
+    flush_every_rows: 1
+    rich:
+      enabled: true
+      save_request_images: true
+      save_action_chunks: true
+      request_snapshot_every_n: 1
+  topics:
+    img_front: /camera_f/color/image_raw
+    img_left: /camera_l/color/image_raw
+    img_right: /camera_r/color/image_raw
+    puppet_arm_left: /puppet/joint_left
+    puppet_arm_right: /puppet/joint_right
+    cmd_joint_left: /master/joint_left
+    cmd_joint_right: /master/joint_right
+    puppet_arm_left_pose: /puppet/end_pose_left
+    puppet_arm_right_pose: /puppet/end_pose_right
+    enable_flag: /enable_flag
+  publish_enable_flag: true
+  use_robot_base: false
+  home_position:
+    # GM100: observed frame 0, task_00110/episode_000026.
+    # Nearest valid recorded start to task-balanced median (106 tasks / 15982 episodes).
+    # Native observation.state.arm.position + effector.position; no IK sign conversion.
+    mode: linear
+    rate_hz: 100
+    num_steps: 200  # 100 Hz x 2 seconds
+    gripper_move_start_fraction: 0.90  # Hold measured opening until the final 0.2 s
+    settle: true
+    require_settle: true
+    settle_tolerance: 0.04
+    settle_hold_sec: 0.5
+    settle_timeout_sec: 8.0
+    settle_rate_hz: 50
+    # left: [-0.377819596, 0.88912068, -0.9858127720000001, -0.052890208, 0.798603764, 0.051477244000000005, -0.0033]
+    left: [-0.021682892, 0.0053029759, -0.0041167838, -0.0205490328, 0.2520832419, -0.0147401802, 0.0005]
+    # right: [0.24744314000000003, 0.8298808560000001, -1.0670669240000001, 0.07858522, 1.018938928, -0.24325658000000003, -0.0032]
+    right: [0.046383597, 0.0066984962, -0.001186192, 0.0358823091, 0.3131895661, 0.0, 0.0002]
+  shutdown_safety:
+    enabled: true
+    hold_current_sec: 0.5
+    hold_rate_hz: 50
+    publish_enable_false: true
+
+zmq:
+  socket_type: req
+  server_bind: tcp://127.0.0.1:5557
+  client_connect: tcp://127.0.0.1:5557

@@ -2,6 +2,8 @@
 policy_backend: "dreamzero"
 
 dreamzero:
+  # model_path: "/workspace/project/dreamzero/checkpoints/xdof_square_stack_vifail_clean_invalid_excluded_agibot_flash_11500_merged"
+  # Previous 10k merged weights:
   model_path: "/workspace/project/dreamzero/checkpoints/xdof_square_stack_vifail_clean_agibot_flash_10k_merged"
   embodiment: "xdof"
   # DreamZero-Flash was fine-tuned with decoupled video/action noise and is
@@ -9,6 +11,22 @@ dreamzero:
   num_inference_steps: 1
   # The local DreamZero inference path predicts one action/state chunk per call.
   max_chunk_size: 1
+  # Set this single switch to true to persist and update the video flow-matching
+  # initial noise from measured endpoint errors. Single-step inference is required.
+  noise_adaptation: false
+  noise_adaptation_config:
+    video_final_noise: 0.8
+    tau_v: 0.2              # must equal 1 - video_final_noise
+    M: 4                    # update once per four observed endpoint errors
+    eta: 0.001              # conservative bootstrap value; calibrate before production
+    lam: 0.1
+    c_clip: 100.0           # bounds each latent endpoint-error norm
+    deadband: 0.0           # zero keeps bootstrap mode active on every coherent window
+    coh_min: 0.0
+    max_delta_norm: 0.25    # hard per-update divergence guard
+    max_error_growth_windows: 2
+    reset_on_episode: true
+    log_path: "../logs/noise_adaptation/pb_metrics.jsonl"
   camera_keys:
     front: "video.cam_high"
     left: "video.cam_left_wrist"
@@ -17,12 +35,13 @@ dreamzero:
   warmup_runs: 3
   warmup_image_hw: [480, 640]
 
-task_prompt: "pick up the orange cube, and place it in the green box"
+task_prompt: "Use the right arm to pick up the orange cube and place it in the cup"
 
 ros:
   image_type: "raw"
   jpeg_quality: 80
-  rate_hz: 5
+  # Default: consume the complete 24-anchor chunk at 15 Hz (1.6 s per chunk).
+  rate_hz: 15
   policy_response_timeout_sec: 60.0
   max_joint_age_sec: 0.75
   max_image_age_sec: 2.0
@@ -30,37 +49,61 @@ ros:
   initial_action_skip_steps: 0
   open_loop_steps: 24
   policy_request:
-    when_live_chunk: "allow"
+    when_live_chunk: "wait"
   chunk_interpolation:
-    enabled: false
+    # Keep all 24 model anchors. Only bridge the measured chunk boundary.
+    enabled: true
     mode: "adaptive_delta"
-    source_steps_to_execute: 4
-    source_overlap_steps: 12
+    source_steps_to_execute: 24
+    source_overlap_steps: 24
     min_factor: 1
-    max_factor: 3
-    initial_bridge_enabled: false
-    initial_bridge_max_factor: 4
-    joint_threshold: [0.030, 0.086, 0.088, 0.049, 0.058, 0.058, 0.0043]
+    max_factor: 1
+    initial_bridge_enabled: true
+    initial_bridge_max_factor: 20
+    # Conservative boundary thresholds retained from the strengthened
+    # anti-vibration profile (25% below the former 15 Hz defaults).
+    joint_threshold: [0.0075, 0.0150, 0.0150, 0.01125, 0.01125, 0.01125, 1000.000]
   delta_clip:
     enabled: false
-    reference: "current"
+    reference: "command"
     max_delta: [0.006, 0.012, 0.012, 0.010, 0.010, 0.010, 1000.000]
   command_delta_deadband:
     enabled: false
     left: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     right: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  first_action_delta_scale:
+    # Disabled for deployment: scaling only index 0 and restoring index 1 to
+    # full strength created a larger artificial 0->1 command discontinuity.
+    enabled: false
+    coefficient: 0.3
+    include_gripper: false
+  initial_pose_delta_override:
+    enabled: true
+    arms: ["right"]  # ["left"], ["right"], or ["left", "right"]
+    include_gripper: false
+  chunk_terminal_displacement_filter:
+    enabled: false
+    left_threshold: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.0]
+    right_threshold: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.0]
   gripper_threshold:
     enabled: false
     close_threshold: [0.35, 0.35]
     open_threshold: [0.50, 0.50]
     close_value: [0.06558, 0.06558]
     open_value: [-0.00547, -0.00547]
+  gripper_delta_scale:
+    enabled: false
+    left_gain: 1.0
+    right_gain: 1.0
+    clip_min: [-0.01, -0.01]
+    clip_max: [0.07, 0.07]
   policy_gripper_input:
-    mode: "observed"
+    mode: "measured"
     hybrid_max_error: 0.025
   command_publish:
-    mode: "direct"
-    rate_hz: 5
+    # Retain five linear publish substeps per 15 Hz policy anchor.
+    mode: "interpolated"
+    rate_hz: 75
     interpolation: "linear"
   eef_ik:
     enabled: false
@@ -69,10 +112,30 @@ ros:
     ema_alpha: 1.0
     deadband: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   action_chunk_smoothing:
-    enabled: true
+    # Boundary bridging plus high-rate linear publish replaces whole-chunk
+    # spline/Savitzky-Golay smoothing and avoids spline overshoot.
+    enabled: false
     upsample_factor: 2
     window_length: 21
     polyorder: 3
+  action_chunk_lowpass:
+    # Inspect the complete 24-anchor chunk at its actual 15 Hz consumption
+    # timebase. Sixth order gives a steeper stop band while zero-phase
+    # filtering and endpoint correction preserve timing and final targets.
+    enabled: true
+    sample_rate_hz: 15
+    cutoff_hz: 1.2
+    order: 6
+    preserve_endpoints: true
+    include_gripper: false
+  action_chunk_monotonic:
+    # Fully project both arms onto each joint's start-to-end direction. This
+    # removes chunk-internal reversals while preserving the exact endpoint.
+    enabled: true
+    arms: ["left", "right"]
+    strength: 0.75
+    min_terminal_delta: 0.0001
+    include_gripper: false
   temporal_ensemble:
     enabled: false
     exp_decay: 0.4
@@ -124,10 +187,17 @@ ros:
     settle_hold_sec: 0.5
     settle_timeout_sec: 8.0
     settle_rate_hz: 50
-    left: [-0.0010295446263626218, 0.30587080121040344, -0.393717885017395, 0.005400840658694506, 0.5136011838912964, 0.08619414269924164, -0.003028000006452203]
-    right: [0.07645199447870255, 0.3571706712245941, -0.38943028450012207, -0.07059866189956665, 0.5584428906440735, 0.015449974685907364, -0.0025159993674606085]
+    # left: [-0.0010295446263626218, 0.30587080121040344, -0.393717885017395, 0.005400840658694506, 0.5136011838912964, 0.08619414269924164, -0.003028000006452203]
+    # right: [0.07645199447870255, 0.3571706712245941, -0.38943028450012207, -0.07059866189956665, 0.5584428906440735, 0.015449974685907364, -0.0025159993674606085]
+    # left: [-0.5124175000000001, 1.043203532, -0.751121196, -0.13866235600000001, 0.503119848, 0.12407917200000002, -0.0026]
+    # right: [0.42188314, 1.019130812, -0.8032613120000001, 0.305932872, 0.691898816, -0.346385508, -0.0024]
+    left: [-0.46245788400000004, 0.5703315800000001, -0.5745704720000001, -0.14905898, 0.6524928200000001, 0.153664196, -0.0035]
+    right: [0.546904288, 0.6532429120000001, -0.62266358, 0.18220258000000003, 0.708522948, -0.31366056400000003, -0.0019]
 
 zmq:
   socket_type: "req"
   server_bind: "tcp://127.0.0.1:5555"
   client_connect: "tcp://127.0.0.1:5555"
+  # Live task-prompt control (local only; separate from inference traffic).
+  prompt_control_bind: "tcp://127.0.0.1:5559"
+  prompt_control_connect: "tcp://127.0.0.1:5559"

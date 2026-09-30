@@ -18,6 +18,11 @@ CobotMagic ROS topics
 
 主な実装は `cobotmagic_deployment/`、カメラ専用ブリッジは `realsense_bridge/` にあります。
 
+このバージョンで対応するポリシーは **OpenPI、OpenVLA、X-VLA、DreamZero、OpenWAM** です。
+対応表は[付録](#付録-対応ポリシー)を参照してください。
+
+OpenWAMの双腕Piper用重み・専用環境・起動手順は [docs/openwam/OPENWAM_PIPER_DEPLOY.md](docs/openwam/OPENWAM_PIPER_DEPLOY.md) を参照してください。
+
 ## 1. 環境構築
 
 ### 1.1 Dockerコンテナを使う場合
@@ -217,9 +222,12 @@ python -m cobotmagic_deployment.servers.policy_server_xvla_agilex \
 | `cobotmagic_deployment/bridges/` | ROS–ZeroMQブリッジ |
 | `cobotmagic_deployment/servers/` | バックエンド別ポリシーサーバー |
 | `cobotmagic_deployment/policies/` | モデル固有のポリシーラッパー |
-| `cobotmagic_deployment/common/` | ポリシーサーバー共通の通信処理 |
+| `cobotmagic_deployment/common/` | 共通通信処理、Piper IK、OpenWAM変換、グリッパー処理などの共通モジュール |
 | `cobotmagic_deployment/configs/` | ROS、通信、アクション、モデル固有のYAML設定 |
 | `cobotmagic_deployment/tools/` | smoke testとモデル検証ツール |
+| `scripts/` | OpenWAM環境構築・起動スクリプトとログ再生・解析スクリプト |
+| `tests/` | IK、OpenWAM変換、グリッパー処理、DreamZeroノイズ適応のテスト |
+| `docs/openwam/` | OpenWAMデプロイ手順と調整・診断記録 |
 | `realsense_bridge/` | カメラ専用ブリッジ |
 | `aloha.yml` | ROSブリッジ用Conda環境 |
 
@@ -232,11 +240,10 @@ python -m cobotmagic_deployment.servers.policy_server_xvla_agilex \
 | --- | --- | --- | --- |
 | OpenPI π₀ / π₀.₅ | `config_openpi.yaml` | `ros_bridge_node.py` | `policy_server_openpi.py` |
 | OpenVLA FiLM | `config_openvla_stack_three_film_absolute_stage2.yaml` | `ros_bridge_node.py` | OpenVLA-OFT側サーバー |
-| SemanticVLA | `config_semanticvla_stack_three_bs8_3k.yaml` | `ros_bridge_node.py` | OpenVLA-OFT側サーバー |
 | OpenVLA右単腕 | `config_single_right_openvla.yaml` | `ros_bridge_node_single_right.py` | OpenVLA-OFT側サーバー |
 | X-VLA | `config_xvla_agilex.yaml` | `ros_bridge_node.py` | `policy_server_xvla_agilex.py` |
-| Hy-VLA EEF | `config_hy_vla_eef.yaml` | `ros_bridge_node.py` | `policy_server_xvla_agilex.py` |
 | DreamZero | `config_dreamzero_agilex.yaml` | `ros_bridge_node.py` | `policy_server_dreamzero_agilex.py` |
+| OpenWAM RoboDojo-Piper | `config_openwam_piper.yaml` | `ros_bridge_node.py`（EEF/IK） | `policy_server_openwam_piper.py` |
 
 ### ポリシーサーバー用環境
 
@@ -245,8 +252,8 @@ python -m cobotmagic_deployment.servers.policy_server_xvla_agilex \
 - OpenPI: `/workspace/project/openpi`
 - OpenVLA-OFT: `/workspace/project/openvla-oft`
 - X-VLA: `/workspace/project/X-VLA`
-- Hy-VLA: `/workspace/project/Hy-Embodied-0.5-VLA`
 - DreamZero: `/workspace/project/dreamzero`
+- OpenWAM: `/workspace/project/OpenWAM`
 
 各モデルリポジトリの手順に従って専用環境を構築し、その環境でポリシーサーバーを起動します。
 チェックポイントや外部リポジトリの場所を変える場合は、対応するYAMLのモデル固有セクションも更新してください。
@@ -269,13 +276,6 @@ python -m cobotmagic_deployment.servers.policy_server_xvla_agilex \
   --config cobotmagic_deployment/configs/config_xvla_agilex.yaml
 ```
 
-Hy-VLA EEF:
-
-```bash
-python -m cobotmagic_deployment.servers.policy_server_xvla_agilex \
-  --config cobotmagic_deployment/configs/config_hy_vla_eef.yaml
-```
-
 DreamZero:
 
 ```bash
@@ -284,7 +284,14 @@ python -m cobotmagic_deployment.servers.policy_server_dreamzero_agilex \
 ```
 
 DreamZeroを複数GPUで動かす場合は、モデル環境に合わせて `torchrun` を使用します。
-OpenVLAとSemanticVLAのポリシーサーバーは、OpenVLA-OFT側の手順に従って起動してください。
+
+OpenWAM（専用環境の構築は `scripts/setup_openwam_piper.sh`）:
+
+```bash
+bash scripts/serve_openwam_piper.sh
+```
+
+OpenVLAのポリシーサーバーは、OpenVLA-OFT側の手順に従って起動してください。
 
 OpenPIの学習、正規化統計、データ変換は外部リポジトリで行います。
 詳細は `/workspace/project/openpi/docs/local_mobile_finetune.md` を参照してください。

@@ -5,6 +5,10 @@ data/
 wandb/
 logs/
 
+# Small files required by deployment/tests.
+!cobotmagic_deployment/assets/
+!tests/data/
+
 # Local backup files.
 *.orig
 

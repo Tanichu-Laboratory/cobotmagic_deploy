@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import json
 import os
 import pickle
 import socket
@@ -22,9 +23,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
+import zmq
 from tianshou.data import Batch
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from cobotmagic_deployment.common.policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
+from cobotmagic_deployment.common.dreamzero_noise_adaptation import (
+    NoiseAdaptationSettings,
+    parse_noise_adaptation_settings,
+)
 
 
 DREAMZERO_REPO = Path("/workspace/project/dreamzero")
@@ -48,11 +54,86 @@ def load_config(path: Path) -> dict[str, Any]:
     if backend != "dreamzero":
         raise ValueError(f"Unsupported policy_backend={backend!r}; expected dreamzero")
     cfg = dict(raw.get("dreamzero", {}))
+    # Accept a root-level switch as well, while keeping the documented location
+    # under ``dreamzero`` authoritative.
+    if "noise_adaptation" not in cfg and "noise_adaptation" in raw:
+        cfg["noise_adaptation"] = raw["noise_adaptation"]
+    if "noise_adaptation_config" not in cfg and "noise_adaptation_config" in raw:
+        cfg["noise_adaptation_config"] = raw["noise_adaptation_config"]
+    cfg["_config_dir"] = str(path.parent)
     cfg["backend"] = backend
     cfg["task_prompt"] = raw.get("task_prompt", cfg.get("task_prompt", "demo-task"))
     cfg["server_bind"] = raw.get("zmq", {}).get("server_bind", "tcp://127.0.0.1:5555")
     cfg["socket_type"] = raw.get("zmq", {}).get("socket_type", "req")
+    cfg["prompt_control_bind"] = raw.get("zmq", {}).get(
+        "prompt_control_bind", "tcp://127.0.0.1:5559"
+    )
+    cfg["prompt_control_connect"] = raw.get("zmq", {}).get(
+        "prompt_control_connect", cfg["prompt_control_bind"]
+    )
     return cfg
+
+
+def run_prompt_control_command(args: argparse.Namespace, cfg: dict[str, Any]) -> bool:
+    """Send a prompt-control command without initializing the policy model."""
+    if args.set_task_prompt is not None:
+        prompt = args.set_task_prompt.strip()
+        if not prompt:
+            raise ValueError("--set-task-prompt must not be empty")
+        request = {"command": "set", "task_prompt": prompt}
+    elif args.clear_task_prompt:
+        request = {"command": "clear"}
+    elif args.get_task_prompt:
+        request = {"command": "get"}
+    else:
+        return False
+
+    endpoint = args.prompt_control_connect or str(cfg["prompt_control_connect"])
+    sock = zmq.Context.instance().socket(zmq.REQ)
+    sock.setsockopt(zmq.LINGER, 0)
+    sock.setsockopt(zmq.SNDTIMEO, args.prompt_control_timeout_ms)
+    sock.setsockopt(zmq.RCVTIMEO, args.prompt_control_timeout_ms)
+    try:
+        sock.connect(endpoint)
+        sock.send_json(request)
+        reply = sock.recv_json()
+    except zmq.Again as exc:
+        raise RuntimeError(
+            f"prompt control server did not respond at {endpoint} within "
+            f"{args.prompt_control_timeout_ms} ms"
+        ) from exc
+    finally:
+        sock.close(0)
+
+    if not reply.get("ok", False):
+        raise RuntimeError(str(reply.get("error", "prompt control command failed")))
+    print(json.dumps(reply, ensure_ascii=False), flush=True)
+    return True
+
+
+def handle_prompt_control_request(
+    request: dict[str, Any],
+    current_override: str | None,
+    default_prompt: str,
+) -> tuple[str | None, dict[str, Any]]:
+    """Apply one prompt-control request and return the new state and reply."""
+    command = str(request.get("command", "")).lower()
+    if command == "set":
+        prompt = str(request.get("task_prompt", "")).strip()
+        if not prompt:
+            raise ValueError("task_prompt must not be empty")
+        current_override = prompt
+    elif command == "clear":
+        current_override = None
+    elif command != "get":
+        raise ValueError(f"unsupported prompt control command: {command!r}")
+
+    return current_override, {
+        "ok": True,
+        "override_active": current_override is not None,
+        "task_prompt": current_override if current_override is not None else default_prompt,
+        "source": "server_override" if current_override is not None else "request_or_config",
+    }
 
 
 def setup_dreamzero_flash(enabled: bool, num_dit_steps: int) -> None:
@@ -221,10 +302,23 @@ class DreamZeroAgilexPolicy:
         num_inference_steps = int(cfg.get("num_inference_steps", 1))
         if num_inference_steps < 1:
             raise ValueError(f"num_inference_steps must be >= 1, got {num_inference_steps}")
+        self.noise_adaptation: NoiseAdaptationSettings = (
+            parse_noise_adaptation_settings(
+                cfg,
+                config_dir=Path(str(cfg.get("_config_dir", "."))),
+            )
+        )
         model_overrides = [
             f"action_head_cfg.config.diffusion_model_cfg.max_chunk_size={max_chunk_size}",
             f"action_head_cfg.config.num_inference_timesteps={num_inference_steps}",
         ]
+        model_overrides.extend(
+            self.noise_adaptation.model_overrides(
+                # Every inference-parallel rank maintains the same adapter state,
+                # but only rank 0 writes the shared JSONL diagnostics.
+                include_log_path=dist.get_rank() == 0,
+            )
+        )
         self.policy = GrootSimPolicy(
             embodiment_tag=EmbodimentTag(str(cfg.get("embodiment", "xdof"))),
             model_path=str(model_path),
@@ -233,6 +327,18 @@ class DreamZeroAgilexPolicy:
             model_config_overrides=model_overrides,
             skip_assert_delta_indices=True,
         )
+        action_head = self._action_head()
+        adapter = getattr(action_head, "pb_adapter", None)
+        if self.noise_adaptation.enabled and adapter is None:
+            raise RuntimeError(
+                "noise_adaptation=true was requested, but DreamZero did not "
+                "construct its initial-noise adapter"
+            )
+        if not self.noise_adaptation.enabled and adapter is not None:
+            raise RuntimeError(
+                "noise_adaptation=false was requested, but DreamZero unexpectedly "
+                "constructed an initial-noise adapter"
+            )
         self._set_eval_transform_max_chunk_size(max_chunk_size)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -240,8 +346,78 @@ class DreamZeroAgilexPolicy:
             f"[dreamzero] model loaded path={model_path} device={device} "
             f"flash_cache={os.environ.get('ENABLE_DIT_CACHE')} "
             f"num_dit_steps={os.environ.get('NUM_DIT_STEPS', 'default')} "
-            f"num_inference_steps={num_inference_steps} "
-            f"max_chunk_size={max_chunk_size}",
+            f"solver_steps={action_head.num_inference_steps} "
+            f"configured_inference_steps={num_inference_steps} "
+            f"max_chunk_size={max_chunk_size} "
+            f"noise_adaptation={self.noise_adaptation.enabled}",
+            flush=True,
+        )
+        if self.noise_adaptation.enabled:
+            print(
+                "[dreamzero] noise adaptation configured "
+                f"tau_v={self.noise_adaptation.tau_v:.6g} "
+                f"M={self.noise_adaptation.window_size} "
+                f"eta={self.noise_adaptation.eta:.6g} "
+                f"c_clip={self.noise_adaptation.c_clip:.6g} "
+                f"deadband={self.noise_adaptation.deadband:.6g} "
+                f"max_delta_norm={self.noise_adaptation.max_delta_norm} "
+                f"log_path={self.noise_adaptation.log_path if dist.get_rank() == 0 else None}",
+                flush=True,
+            )
+
+    def _action_head(self) -> Any:
+        trained_model = getattr(self.policy, "trained_model", None)
+        action_head = getattr(trained_model, "action_head", None)
+        if action_head is None:
+            raise RuntimeError("loaded DreamZero policy has no action_head")
+        return action_head
+
+    def reset_sequence_state(self, reason: str) -> None:
+        """Clear causal inference and noise-adaptation state at an episode boundary."""
+        action_head = self._action_head()
+        action_head.current_start_frame = 0
+        if hasattr(action_head, "language"):
+            action_head.language = None
+        if hasattr(action_head, "prompt_embs"):
+            action_head.prompt_embs = None
+        if hasattr(action_head, "reset_pb_adapter"):
+            action_head.reset_pb_adapter()
+        if dist.get_rank() == 0:
+            print(
+                f"[dreamzero] sequence state reset reason={reason} "
+                f"noise_adaptation={self.noise_adaptation.enabled}",
+                flush=True,
+            )
+
+    def noise_adaptation_status(self) -> dict[str, Any]:
+        action_head = self._action_head()
+        adapter = getattr(action_head, "pb_adapter", None)
+        if adapter is None:
+            return {"enabled": False}
+        last_result = adapter.last_result
+        return {
+            "enabled": True,
+            "initialized": adapter.initialized,
+            "frozen": adapter.frozen,
+            "buffer_size": adapter.buffer_size,
+            "window_size": adapter.config.M,
+            "window_index": adapter.window_index,
+            "last_updated": None if last_result is None else last_result.updated,
+            "last_reason": None if last_result is None else last_result.reason,
+        }
+
+    def _print_noise_adaptation_status(self) -> None:
+        if not self.noise_adaptation.enabled or dist.get_rank() != 0:
+            return
+        status = self.noise_adaptation_status()
+        print(
+            "[dreamzero] noise adaptation status "
+            f"initialized={status['initialized']} "
+            f"buffer={status['buffer_size']}/{status['window_size']} "
+            f"window={status['window_index']} "
+            f"updated={status['last_updated']} "
+            f"reason={status['last_reason']} "
+            f"frozen={status['frozen']}",
             flush=True,
         )
 
@@ -259,6 +435,14 @@ class DreamZeroAgilexPolicy:
         print(f"[dreamzero] eval transform max_chunk_size override applied to {changed} transform(s)", flush=True)
 
     def predict(self, header: dict[str, Any], imgs: dict[str, np.ndarray]) -> np.ndarray:
+        reset_requested = bool(
+            header.get("episode_start", False)
+            or header.get("reset_noise_adaptation", False)
+        )
+        if reset_requested:
+            self.reset_sequence_state("request")
+            if dist.get_world_size() > 1:
+                broadcast_signal(2, self.signal_group)
         obs = make_observation(header, imgs, self.default_prompt, self.camera_keys)
         if dist.get_world_size() > 1:
             broadcast_signal(0, self.signal_group)
@@ -267,6 +451,7 @@ class DreamZeroAgilexPolicy:
         batch, _video_pred = self.policy.lazy_joint_forward_causal(Batch(obs=obs))
         if dist.get_world_size() > 1:
             dist.barrier()
+        self._print_noise_adaptation_status()
         return action_batch_to_numpy(batch.act)
 
     def warmup(self, cfg: dict[str, Any]) -> None:
@@ -290,6 +475,11 @@ class DreamZeroAgilexPolicy:
             f"total={values.sum():.3f}s final={values[-1]:.3f}s",
             flush=True,
         )
+        # Warmup observations must never become the first PB error window or
+        # remain in the causal KV cache used for the real episode.
+        self.reset_sequence_state("warmup_complete")
+        if dist.get_world_size() > 1:
+            broadcast_signal(2, self.signal_group)
 
 
 def worker_loop(policy: DreamZeroAgilexPolicy, signal_group: dist.ProcessGroup | None) -> None:
@@ -299,6 +489,7 @@ def worker_loop(policy: DreamZeroAgilexPolicy, signal_group: dist.ProcessGroup |
         if signal == 1:
             break
         if signal == 2:
+            policy.reset_sequence_state("rank0_request")
             continue
         obs = receive_obs_on_worker()
         batch = Batch(obs=obs)
@@ -357,6 +548,33 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_dreamzero_agilex.yaml")
     parser.add_argument("--bind", default="", help="Override zmq.server_bind from config YAML")
+    parser.add_argument(
+        "--prompt-control-bind",
+        default="",
+        help="Override zmq.prompt_control_bind for the running server",
+    )
+    parser.add_argument(
+        "--prompt-control-connect",
+        default="",
+        help="Override zmq.prompt_control_connect for a prompt-control command",
+    )
+    parser.add_argument("--prompt-control-timeout-ms", type=int, default=5000)
+    prompt_command = parser.add_mutually_exclusive_group()
+    prompt_command.add_argument(
+        "--set-task-prompt",
+        metavar="PROMPT",
+        help="Update the prompt of an already-running server and exit",
+    )
+    prompt_command.add_argument(
+        "--clear-task-prompt",
+        action="store_true",
+        help="Clear the live override and resume prompts supplied by the bridge",
+    )
+    prompt_command.add_argument(
+        "--get-task-prompt",
+        action="store_true",
+        help="Print the prompt state of an already-running server and exit",
+    )
     parser.add_argument("--flash", action="store_true", default=True, help="Enable DreamZero-Flash style DiT cache/mask")
     parser.add_argument("--no-flash", dest="flash", action="store_false", help="Disable Flash-style cache/mask")
     parser.add_argument("--num-dit-steps", type=int, default=1, help="DiT cache compute budget; use 1 for single-step Flash inference")
@@ -371,8 +589,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_config(Path(args.config).expanduser().resolve())
+    if run_prompt_control_command(args, cfg):
+        return
     if args.bind:
         cfg["server_bind"] = args.bind
+    if args.prompt_control_bind:
+        cfg["prompt_control_bind"] = args.prompt_control_bind
 
     setup_dreamzero_flash(args.flash, args.num_dit_steps)
     rank, world_size, device, device_mesh, signal_group = setup_distributed(args.timeout_seconds)
@@ -399,9 +621,20 @@ def main() -> None:
             return
 
         sock, server_kind_name = bind_server(str(cfg["server_bind"]), str(cfg["socket_type"]))
+        prompt_control_sock = zmq.Context.instance().socket(zmq.REP)
+        prompt_control_sock.setsockopt(zmq.LINGER, 0)
+        prompt_control_sock.bind(str(cfg["prompt_control_bind"]))
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        poller.register(prompt_control_sock, zmq.POLLIN)
+        prompt_override: str | None = None
         print(
             f"[dreamzero] CobotMagic server bind {cfg['server_bind']} "
             f"using ZMQ {server_kind_name} ({cfg['socket_type']} protocol)",
+            flush=True,
+        )
+        print(
+            f"[dreamzero] prompt control bind {cfg['prompt_control_bind']} using ZMQ REP",
             flush=True,
         )
 
@@ -415,11 +648,36 @@ def main() -> None:
         while True:
             try:
                 print("[dreamzero] waiting for request", flush=True)
+                events = dict(poller.poll())
+                if prompt_control_sock in events:
+                    try:
+                        request = prompt_control_sock.recv_json()
+                        prompt_override, reply = handle_prompt_control_request(
+                            request,
+                            prompt_override,
+                            str(cfg["task_prompt"]),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        reply = {"ok": False, "error": str(exc)}
+                    prompt_control_sock.send_json(reply)
+                    if reply.get("ok", False):
+                        print(
+                            f"[dreamzero] prompt control source={reply['source']} "
+                            f"task={reply['task_prompt']!r}",
+                            flush=True,
+                        )
+                    continue
+
                 header, imgs = recv_packet(sock)
                 started = time.perf_counter()
                 control_hz = float(header.get("control_hz", 20.0))
+                request_prompt = str(header.get("task_prompt", cfg["task_prompt"]))
+                effective_prompt = prompt_override if prompt_override is not None else request_prompt
+                header = dict(header)
+                header["task_prompt"] = effective_prompt
                 print(
-                    f"[dreamzero] request received task={header.get('task_prompt', cfg['task_prompt'])!r} "
+                    f"[dreamzero] request received task={effective_prompt!r} "
+                    f"prompt_source={'server_override' if prompt_override is not None else 'request'} "
                     f"control_hz={control_hz}",
                     flush=True,
                 )
@@ -436,6 +694,8 @@ def main() -> None:
                 print(f"[dreamzero] request error: {exc}", flush=True)
                 send_empty(sock, str(exc), action_mode="absolute")
     finally:
+        if rank == 0 and "prompt_control_sock" in locals():
+            prompt_control_sock.close(0)
         if rank == 0 and world_size > 1:
             try:
                 broadcast_signal(1, signal_group)
