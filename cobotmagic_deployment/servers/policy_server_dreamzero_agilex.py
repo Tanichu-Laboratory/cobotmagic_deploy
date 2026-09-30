@@ -33,14 +33,7 @@ from cobotmagic_deployment.common.dreamzero_noise_adaptation import (
 )
 
 
-DREAMZERO_REPO = Path("/workspace/project/dreamzero")
-if str(DREAMZERO_REPO) not in sys.path:
-    sys.path.insert(0, str(DREAMZERO_REPO))
-
-from groot.vla.data.schema import EmbodimentTag  # noqa: E402
-from groot.vla.model.n1_5.sim_policy import GrootSimPolicy  # noqa: E402
-
-
+DEFAULT_DREAMZERO_REPO = "/workspace/project/dreamzero"
 DEFAULT_CKPT = (
     "/workspace/project/dreamzero/checkpoints/"
     "robomind_agilex_3rgb_lora_3gpu_gbs6_pdbs2_chunk4_10k_save2k_wandb_v4_alloc/"
@@ -278,6 +271,17 @@ def action_batch_to_numpy(action_batch: Any) -> np.ndarray:
     return np.concatenate([left[:horizon, :7], right[:horizon, :7]], axis=-1).astype(np.float32)
 
 
+def import_dreamzero(repo_path: str | Path) -> tuple[Any, Any]:
+    """Import DreamZero from its external repository (``dreamzero.repo_path``)."""
+    repo = str(Path(repo_path).expanduser())
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    from groot.vla.data.schema import EmbodimentTag
+    from groot.vla.model.n1_5.sim_policy import GrootSimPolicy
+
+    return EmbodimentTag, GrootSimPolicy
+
+
 class DreamZeroAgilexPolicy:
     def __init__(
         self,
@@ -319,6 +323,7 @@ class DreamZeroAgilexPolicy:
                 include_log_path=dist.get_rank() == 0,
             )
         )
+        EmbodimentTag, GrootSimPolicy = import_dreamzero(cfg.get("repo_path", DEFAULT_DREAMZERO_REPO))
         self.policy = GrootSimPolicy(
             embodiment_tag=EmbodimentTag(str(cfg.get("embodiment", "xdof"))),
             model_path=str(model_path),

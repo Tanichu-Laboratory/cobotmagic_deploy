@@ -16,10 +16,10 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-import cv2
 import numpy as np
 import yaml
 import zmq
+from cobotmagic_deployment.common.policy_server_protocol import client_socket_kind, encode_jpeg
 
 import rospy
 from cv_bridge import CvBridge
@@ -37,13 +37,6 @@ buf: dict[str, Any] = {
 buf_seq = {key: 0 for key in buf}
 buf_time: dict[str, Optional[float]] = {key: None for key in buf}
 enable_state = True
-
-
-def encode_jpeg(img: np.ndarray, quality: int = 80) -> Optional[bytes]:
-    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        return None
-    return enc.tobytes()
 
 
 def img_cb(which: str, mode: str = "raw", quality: int = 80):
@@ -148,18 +141,9 @@ def move_home(pub: rospy.Publisher, cfg: dict[str, Any]) -> None:
         rate.sleep()
 
 
-def zmq_socket_kind(name: str) -> int:
-    normalized = str(name).lower()
-    if normalized == "pair":
-        return zmq.PAIR
-    if normalized == "req":
-        return zmq.REQ
-    raise ValueError(f"Unsupported zmq.socket_type={name!r}; expected 'pair' or 'req'.")
-
-
 def make_socket(cfg: dict[str, Any]) -> zmq.Socket:
     ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq_socket_kind(cfg["zmq"].get("socket_type", "req")))
+    sock = ctx.socket(client_socket_kind(cfg["zmq"].get("socket_type", "req")))
     timeout_ms = int(float(cfg["ros"].get("policy_response_timeout_sec", 5.0)) * 1000.0)
     sock.setsockopt(zmq.LINGER, 0)
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms)

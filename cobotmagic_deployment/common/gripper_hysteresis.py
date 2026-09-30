@@ -75,3 +75,18 @@ class GripperHysteresis:
                        'close_threshold_normalized': close_threshold.tolist(),
                        'open_threshold_normalized': open_threshold.tolist()}
         return values, candidate, diagnostics
+
+    def hold(self, arm_index, published_value, diagnostics):
+        """Re-sync one arm to a gripper value published instead of the proposal.
+
+        Used when IK holds the last safe command: the proposed transition was
+        not published, so the binary state follows ``published_value`` and any
+        pending confirmation count is cleared. ``diagnostics`` is updated in place.
+        """
+        fraction = ((published_value - self.closed[arm_index]) /
+                    (self.opened[arm_index] - self.closed[arm_index]))
+        self.is_open[arm_index] = fraction >= 0.5
+        self.count[arm_index] = 0
+        diagnostics['output_open'][arm_index] = bool(fraction >= 0.5)
+        diagnostics['switched'][arm_index] = False
+        diagnostics['pending_count'][arm_index] = 0

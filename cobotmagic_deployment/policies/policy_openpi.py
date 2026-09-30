@@ -1,6 +1,7 @@
 import os
 import sys
 
+import cv2
 import numpy as np
 import torch.nn as nn
 
@@ -21,6 +22,13 @@ from openpi.shared import download  # noqa: E402
 
 DEFAULT_POLICY_CONFIG_NAME = "pi0_mobile_aloha_lora_local"
 DEFAULT_CHECKPOINT_DIR = "/workspace/project/openpi/checkpoints/pi0_mobile_aloha_lora_local/mobile_aloha_lora/10000"
+
+
+def preprocess_image(img_rgb, out_hw=(256, 256)):
+    """Resize an HWC uint8 RGB image and return CHW float32 in [0, 1]."""
+    img = cv2.resize(img_rgb, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_AREA)
+    img = img.astype(np.float32) / 255.0
+    return np.transpose(img, (2, 0, 1))
 
 
 class Pi0Policy(nn.Module):

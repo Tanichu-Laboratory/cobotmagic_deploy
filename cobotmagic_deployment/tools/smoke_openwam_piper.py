@@ -14,7 +14,7 @@ from cobotmagic_deployment.servers.policy_server_openwam_piper import test_obser
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="cobotmagic_deployment/configs/config_openwam_piper.yaml")
+    parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_openwam_piper.yaml")
     parser.add_argument("--requests", type=int, default=2)
     args = parser.parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text())

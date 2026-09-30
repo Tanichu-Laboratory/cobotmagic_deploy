@@ -9,40 +9,37 @@ ROS Noetic side bridge (Python 3.8).
 """
 
 import argparse
-import csv
-import glob
-import sys
 import json
-import os
 import threading
 import time
 
-import cv2
 import numpy as np
 import yaml
 import zmq
-from cobotmagic_deployment.common.gripper_hysteresis import GripperHysteresis
-from cobotmagic_deployment.common.piper_ik import (
-    PiperNumericalIK, rpy_xyz_to_matrix, axis_angle_to_matrix,
-    transform_from_xyz_rpy, transform_from_pose_command, rotation_error_vector,
-    parse_float_triplet,
+from cobotmagic_deployment.bridges.action_logging import (
+    make_action_logger, make_rollout_dataset_logger, norm_first_six,
+    save_action_chunk, save_request_snapshot, save_rollout_action,
+    save_rollout_observation, vector_to_json, write_action_log,
 )
-from scipy.interpolate import CubicSpline
-from scipy.signal import butter, savgol_filter, sosfiltfilt
+from cobotmagic_deployment.common.action_processing import (
+    adaptive_bridge_to_first_action, adaptive_delta_upsample_chunks,
+    apply_joint_delta_deadband, clip_joint_delta, eef_pose_and_gripper_to_command,
+    eef_pose_and_gripper_to_ee6d, exponential_temporal_ensemble,
+    filter_chunk_by_terminal_displacement, interpolate_arm_command_keep_gripper,
+    interpolate_with_segment_factors, linear_upsample_chunk,
+    lowpass_dual_action_chunks_zero_phase, override_arm_delta_from_initial_pose,
+    parse_arm_selection,
+    project_action_chunk_monotonic_to_endpoint, scale_action_delta_from_reference,
+    scale_gripper_deltas, smooth_dual_action_chunks_savgol, step_towards,
+    threshold_gripper_targets, validate_policy_action_mode,
+)
+from cobotmagic_deployment.common.gripper_hysteresis import GripperHysteresis
+from cobotmagic_deployment.common.piper_ik import PiperNumericalIK
+from cobotmagic_deployment.common.policy_server_protocol import client_socket_kind, encode_jpeg
 
 import rospy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist, PoseStamped
-try:
-    from piper_msgs.msg import PosCmd
-except Exception:  # noqa: BLE001
-    for _p in glob.glob("/workspace/ros_cobotmagic/Piper_ros_private-ros-noetic/devel/lib/python*/dist-packages"):
-        if _p not in sys.path:
-            sys.path.append(_p)
-    try:
-        from piper_msgs.msg import PosCmd
-    except Exception:  # noqa: BLE001
-        PosCmd = None
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage, Image, JointState
 from std_msgs.msg import Bool
@@ -65,48 +62,14 @@ buf_time = {key: None for key in buf}
 lock = threading.Lock()
 enable_state = True  # /enable_flag があればこれに従う
 published_first_command = False
+CAMERA_KEYS = ('front', 'left', 'right')
 
 
-def encode_jpeg(img, quality=80):
-    ok, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-    if not ok:
-        return None
-    return enc.tobytes()
-
-
-def quat_xyzw_to_matrix(quat):
-    x, y, z, w = [float(v) for v in quat]
-    norm = (x * x + y * y + z * z + w * w) ** 0.5
-    if norm <= 1e-8:
-        return np.eye(3, dtype=np.float32)
-    x, y, z, w = x / norm, y / norm, z / norm, w / norm
-    xx, yy, zz = x * x, y * y, z * z
-    xy, xz, yz = x * y, x * z, y * z
-    wx, wy, wz = w * x, w * y, w * z
-    return np.asarray([
-        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
-        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
-        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
-    ], dtype=np.float32)
-
-
-def quat_xyzw_to_rot6d(quat):
-    mat = quat_xyzw_to_matrix(quat)
-    return mat[:, :2].reshape(-1).astype(np.float32)
-
-
-def quat_xyzw_to_euler_xyz(quat):
-    mat = quat_xyzw_to_matrix(quat).astype(np.float64)
-    # Match scipy.spatial.transform.Rotation.as_euler("xyz") / from_euler("xyz").
-    sy = float(np.clip(-mat[2, 0], -1.0, 1.0))
-    pitch = np.arcsin(sy)
-    if abs(sy) < 0.999999:
-        roll = np.arctan2(mat[2, 1], mat[2, 2])
-        yaw = np.arctan2(mat[1, 0], mat[0, 0])
-    else:
-        roll = np.arctan2(-mat[1, 2], mat[1, 1])
-        yaw = 0.0
-    return np.asarray([roll, pitch, yaw], dtype=np.float32)
+def store_observation(key, value):
+    with lock:
+        buf[key] = value
+        buf_seq[key] += 1
+        buf_time[key] = time.monotonic()
 
 
 def eef_pose_msg_to_list(msg):
@@ -121,44 +84,19 @@ def eef_pose_msg_to_list(msg):
     ]
 
 
-def eef_pose_and_gripper_to_ee6d(pose, gripper):
-    pose_arr = np.asarray(pose, dtype=np.float32)
-    return np.concatenate([
-        pose_arr[:3],
-        quat_xyzw_to_rot6d(pose_arr[3:7]),
-        np.asarray([float(gripper)], dtype=np.float32),
-    ])
-
-
-def eef_pose_and_gripper_to_command(pose, gripper):
-    pose_arr = np.asarray(pose, dtype=np.float32)
-    return np.concatenate([
-        pose_arr[:3],
-        quat_xyzw_to_euler_xyz(pose_arr[3:7]),
-        np.asarray([float(gripper)], dtype=np.float32),
-    ])
-
-
 def img_cb(which, mode='raw', quality=80):
     use_compressed = (mode == 'compressed')
 
     def f(msg):
         try:
             if use_compressed:
-                data = bytes(msg.data)
-                # best effort verification (optional)
-                if not data:
-                    return
-                payload = data
+                payload = bytes(msg.data)
             else:
                 img = bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
                 payload = encode_jpeg(img, quality=quality)
-                if payload is None:
-                    return
-            with lock:
-                buf[which] = payload
-                buf_seq[which] += 1
-                buf_time[which] = time.monotonic()
+            if not payload:
+                return
+            store_observation(which, payload)
         except Exception as exc:  # noqa: BLE001
             rospy.logwarn(f"image cb error {which}: {exc}")
 
@@ -166,38 +104,23 @@ def img_cb(which, mode='raw', quality=80):
 
 
 def jl_cb(msg: JointState):
-    with lock:
-        buf['jl'] = list(msg.position)
-        buf_seq['jl'] += 1
-        buf_time['jl'] = time.monotonic()
+    store_observation('jl', list(msg.position))
 
 
 def jr_cb(msg: JointState):
-    with lock:
-        buf['jr'] = list(msg.position)
-        buf_seq['jr'] += 1
-        buf_time['jr'] = time.monotonic()
+    store_observation('jr', list(msg.position))
 
 
 def eef_left_cb(msg: PoseStamped):
-    with lock:
-        buf['eef_l'] = eef_pose_msg_to_list(msg)
-        buf_seq['eef_l'] += 1
-        buf_time['eef_l'] = time.monotonic()
+    store_observation('eef_l', eef_pose_msg_to_list(msg))
 
 
 def eef_right_cb(msg: PoseStamped):
-    with lock:
-        buf['eef_r'] = eef_pose_msg_to_list(msg)
-        buf_seq['eef_r'] += 1
-        buf_time['eef_r'] = time.monotonic()
+    store_observation('eef_r', eef_pose_msg_to_list(msg))
 
 
 def odom_cb(msg: Odometry):
-    with lock:
-        buf['odom'] = [msg.twist.twist.linear.x, msg.twist.twist.angular.z]
-        buf_seq['odom'] += 1
-        buf_time['odom'] = time.monotonic()
+    store_observation('odom', [msg.twist.twist.linear.x, msg.twist.twist.angular.z])
 
 
 def enable_cb(msg: Bool):
@@ -205,24 +128,29 @@ def enable_cb(msg: Bool):
     enable_state = bool(msg.data)
 
 
-def have_obs(use_base=False, require_eef=False):
+def required_obs_keys(include_eef=False):
+    keys = list(CAMERA_KEYS) + ['jl', 'jr']
+    if include_eef:
+        keys.extend(['eef_l', 'eef_r'])
+    return keys
+
+
+def missing_obs_keys(use_base=False, require_eef=False):
     with lock:
-        required = ['front', 'left', 'right', 'jl', 'jr']
-        if require_eef:
-            required.extend(['eef_l', 'eef_r'])
-        ok = all(buf[key] is not None for key in required)
-        if use_base:
-            ok = ok and (buf['odom'] is not None)
-        return ok
+        missing = [key for key in required_obs_keys(require_eef) if buf[key] is None]
+        if use_base and buf['odom'] is None:
+            missing.append('odom')
+    return missing
+
+
+def have_obs(use_base=False, require_eef=False):
+    return not missing_obs_keys(use_base, require_eef)
 
 
 def snapshot(task_prompt: str, use_base=False, include_eef=False):
     """Capture a coherent observation while keeping callback lock time minimal."""
     with lock:
-        required = ['front', 'left', 'right', 'jl', 'jr']
-        if include_eef:
-            required.extend(['eef_l', 'eef_r'])
-        if not all(buf[key] is not None for key in required):
+        if not all(buf[key] is not None for key in required_obs_keys(include_eef)):
             return None
         front = bytes(buf['front'])
         left = bytes(buf['left'])
@@ -264,13 +192,6 @@ def snapshot(task_prompt: str, use_base=False, include_eef=False):
     return pkt
 
 
-def latest_joint_arrays():
-    with lock:
-        jl = None if buf['jl'] is None else np.array(buf['jl'], dtype=np.float32)
-        jr = None if buf['jr'] is None else np.array(buf['jr'], dtype=np.float32)
-    return jl, jr
-
-
 def latest_joint_arrays_and_age():
     now = time.monotonic()
     with lock:
@@ -296,1153 +217,8 @@ def wait_for_joint_arrays(timeout_sec=10.0):
     return None, None
 
 
-def step_towards(current, target, step_lengths):
-    next_pos = current.copy()
-    for idx, step_len in enumerate(step_lengths):
-        diff = target[idx] - current[idx]
-        if abs(diff) <= step_len:
-            next_pos[idx] = target[idx]
-        else:
-            next_pos[idx] = current[idx] + np.sign(diff) * step_len
-    return next_pos
-
-
-def clip_joint_delta(current, target, max_delta):
-    delta = target - current
-    return current + np.clip(delta, -max_delta, max_delta)
-
-
-def apply_joint_delta_deadband(command_before, target, deadband):
-    if deadband is None:
-        return target, np.zeros_like(target, dtype=np.float32)
-    out = target.copy()
-    desired_delta = out - command_before
-    small = np.abs(desired_delta) < deadband
-    out[small] = command_before[small]
-    return out, target - out
-
-
-def validate_policy_action_mode(rep_header, expected_action_mode):
-    server_action_mode = rep_header.get('action_mode')
-    if server_action_mode is None:
-        return
-    server_action_mode = str(server_action_mode).lower()
-    if server_action_mode != expected_action_mode:
-        raise ValueError(
-            f"Policy server action_mode={server_action_mode!r} does not match "
-            f"ros.action_mode={expected_action_mode!r}"
-        )
-
-
-def threshold_gripper_targets(target_left, target_right, close_thresholds, open_thresholds, close_values, open_values):
-    out_left = target_left.copy()
-    out_right = target_right.copy()
-    if out_left[-1] >= open_thresholds[0]:
-        out_left[-1] = open_values[0]
-    elif out_left[-1] <= close_thresholds[0]:
-        out_left[-1] = close_values[0]
-    if out_right[-1] >= open_thresholds[1]:
-        out_right[-1] = open_values[1]
-    elif out_right[-1] <= close_thresholds[1]:
-        out_right[-1] = close_values[1]
-    return out_left, out_right
-
-
-def scale_gripper_deltas(
-    target_left,
-    target_right,
-    reference_left,
-    reference_right,
-    gains,
-    clip_min=None,
-    clip_max=None,
-):
-    """Scale only the gripper displacement from a request-time reference."""
-    out_left = np.asarray(target_left, dtype=np.float32).copy()
-    out_right = np.asarray(target_right, dtype=np.float32).copy()
-    ref_left = np.asarray(reference_left, dtype=np.float32)
-    ref_right = np.asarray(reference_right, dtype=np.float32)
-    gains = np.asarray(gains, dtype=np.float32)
-    if out_left.size == 0 or out_right.size == 0 or ref_left.size == 0 or ref_right.size == 0:
-        return out_left, out_right
-    if gains.shape != (2,):
-        raise ValueError(f"gripper delta gains must have shape (2,), got {gains.shape}")
-
-    out_left[-1] = ref_left[-1] + gains[0] * (out_left[-1] - ref_left[-1])
-    out_right[-1] = ref_right[-1] + gains[1] * (out_right[-1] - ref_right[-1])
-    if clip_min is not None:
-        clip_min = np.asarray(clip_min, dtype=np.float32)
-        out_left[-1] = max(out_left[-1], clip_min[0])
-        out_right[-1] = max(out_right[-1], clip_min[1])
-    if clip_max is not None:
-        clip_max = np.asarray(clip_max, dtype=np.float32)
-        out_left[-1] = min(out_left[-1], clip_max[0])
-        out_right[-1] = min(out_right[-1], clip_max[1])
-    return out_left, out_right
-
-
-def filter_chunk_by_terminal_displacement(
-    left_mat,
-    right_mat,
-    initial_left,
-    initial_right,
-    steps_to_execute,
-    left_threshold,
-    right_threshold,
-):
-    """Cancel a joint's whole chunk when its consumed endpoint has no net displacement."""
-    out_left = np.asarray(left_mat, dtype=np.float32).copy()
-    out_right = np.asarray(right_mat, dtype=np.float32).copy()
-    initial_left = np.asarray(initial_left, dtype=np.float32)
-    initial_right = np.asarray(initial_right, dtype=np.float32)
-    left_threshold = np.asarray(left_threshold, dtype=np.float32)
-    right_threshold = np.asarray(right_threshold, dtype=np.float32)
-    if out_left.ndim != 2 or out_right.ndim != 2 or out_left.shape[0] != out_right.shape[0]:
-        raise ValueError("terminal displacement filter expects left/right 2D chunks with equal horizons")
-    if initial_left.shape != (out_left.shape[1],) or initial_right.shape != (out_right.shape[1],):
-        raise ValueError("terminal displacement filter initial state width does not match action width")
-    if left_threshold.shape != initial_left.shape or right_threshold.shape != initial_right.shape:
-        raise ValueError("terminal displacement filter thresholds must match the left/right action widths")
-    if out_left.shape[0] == 0:
-        return out_left, out_right, np.zeros_like(initial_left), np.zeros_like(initial_right), np.zeros_like(initial_left, dtype=bool), np.zeros_like(initial_right, dtype=bool), -1
-
-    endpoint_index = min(max(int(steps_to_execute), 1), out_left.shape[0]) - 1
-    left_delta = out_left[endpoint_index] - initial_left
-    right_delta = out_right[endpoint_index] - initial_right
-    cancel_left = np.abs(left_delta) < left_threshold
-    cancel_right = np.abs(right_delta) < right_threshold
-    out_left[:, cancel_left] = initial_left[cancel_left]
-    out_right[:, cancel_right] = initial_right[cancel_right]
-    return out_left, out_right, left_delta, right_delta, cancel_left, cancel_right, endpoint_index
-
-
-def override_arm_delta_from_initial_pose(
-    target_left,
-    target_right,
-    initial_left,
-    initial_right,
-    override_left,
-    override_right,
-    include_gripper=False,
-):
-    """Make the selected arm's command delta from its chunk-start pose exactly zero."""
-    out_left = np.asarray(target_left, dtype=np.float32).copy()
-    out_right = np.asarray(target_right, dtype=np.float32).copy()
-    initial_left = np.asarray(initial_left, dtype=np.float32)
-    initial_right = np.asarray(initial_right, dtype=np.float32)
-    if out_left.shape != initial_left.shape or out_right.shape != initial_right.shape:
-        raise ValueError("initial-pose delta override target and initial-state widths must match")
-
-    stop = out_left.shape[0] if include_gripper else max(out_left.shape[0] - 1, 0)
-    if override_left:
-        out_left[:stop] = initial_left[:stop]
-    if override_right:
-        out_right[:stop] = initial_right[:stop]
-    return out_left, out_right
-
-
-def scale_action_delta_from_reference(
-    target_left,
-    target_right,
-    reference_left,
-    reference_right,
-    coefficient,
-    include_gripper=False,
-):
-    """Scale an action delta from a reference while optionally preserving grippers."""
-    out_left = np.asarray(target_left, dtype=np.float32).copy()
-    out_right = np.asarray(target_right, dtype=np.float32).copy()
-    reference_left = np.asarray(reference_left, dtype=np.float32)
-    reference_right = np.asarray(reference_right, dtype=np.float32)
-    if out_left.shape != reference_left.shape or out_right.shape != reference_right.shape:
-        raise ValueError("action-delta scale target and reference widths must match")
-
-    coefficient = float(coefficient)
-    left_stop = out_left.shape[0] if include_gripper else max(out_left.shape[0] - 1, 0)
-    right_stop = out_right.shape[0] if include_gripper else max(out_right.shape[0] - 1, 0)
-    out_left[:left_stop] = (
-        reference_left[:left_stop]
-        + coefficient * (out_left[:left_stop] - reference_left[:left_stop])
-    )
-    out_right[:right_stop] = (
-        reference_right[:right_stop]
-        + coefficient * (out_right[:right_stop] - reference_right[:right_stop])
-    )
-    return out_left, out_right
-
-
-def smooth_action_chunk_savgol(mat, upsample_factor=2, window_length=21, polyorder=3):
-    """Apply the DreamZero paper's cubic-upsample/Savitzky-Golay smoothing."""
-    mat = np.asarray(mat, dtype=np.float32)
-    if mat.ndim != 2 or mat.shape[0] < 2:
-        return mat.copy()
-
-    upsample_factor = max(int(upsample_factor), 1)
-    polyorder = max(int(polyorder), 0)
-    source_time = np.arange(mat.shape[0], dtype=np.float64)
-    upsampled_time = np.linspace(
-        0.0,
-        float(mat.shape[0] - 1),
-        mat.shape[0] * upsample_factor,
-        dtype=np.float64,
-    )
-    upsampled = CubicSpline(source_time, mat, axis=0)(upsampled_time)
-
-    max_window = upsampled.shape[0] if upsampled.shape[0] % 2 == 1 else upsampled.shape[0] - 1
-    window_length = min(max(int(window_length), polyorder + 2), max_window)
-    if window_length % 2 == 0:
-        window_length -= 1
-    if window_length <= polyorder:
-        return mat.copy()
-
-    smoothed = savgol_filter(
-        upsampled,
-        window_length=window_length,
-        polyorder=polyorder,
-        axis=0,
-        mode='interp',
-    )
-    return CubicSpline(upsampled_time, smoothed, axis=0)(source_time).astype(np.float32)
-
-
-def smooth_dual_action_chunks_savgol(left_mat, right_mat, upsample_factor=2, window_length=21, polyorder=3):
-    """Smooth both arms in one vectorized pass without coupling their columns."""
-    left_mat = np.asarray(left_mat, dtype=np.float32)
-    right_mat = np.asarray(right_mat, dtype=np.float32)
-    if left_mat.ndim != 2 or right_mat.ndim != 2 or left_mat.shape[0] != right_mat.shape[0]:
-        return left_mat.copy(), right_mat.copy()
-
-    left_width = left_mat.shape[1]
-    combined = np.concatenate((left_mat, right_mat), axis=1)
-    smoothed = smooth_action_chunk_savgol(
-        combined,
-        upsample_factor=upsample_factor,
-        window_length=window_length,
-        polyorder=polyorder,
-    )
-    return smoothed[:, :left_width].copy(), smoothed[:, left_width:].copy()
-
-
-def lowpass_action_chunk_zero_phase(
-    mat,
-    sample_rate_hz,
-    cutoff_hz,
-    order=4,
-    preserve_endpoints=True,
-    include_gripper=False,
-):
-    """Remove chunk-wide high-frequency motion without phase delay."""
-    mat = np.asarray(mat, dtype=np.float32)
-    if mat.ndim != 2:
-        raise ValueError("chunk low-pass input must be a 2D action matrix")
-    if mat.shape[0] < 3 or mat.shape[1] == 0:
-        return mat.copy()
-
-    sample_rate_hz = float(sample_rate_hz)
-    cutoff_hz = float(cutoff_hz)
-    order = max(int(order), 1)
-    if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0.0:
-        raise ValueError("chunk low-pass sample_rate_hz must be positive")
-    nyquist_hz = 0.5 * sample_rate_hz
-    if (
-        not np.isfinite(cutoff_hz)
-        or cutoff_hz <= 0.0
-        or cutoff_hz >= nyquist_hz
-    ):
-        raise ValueError(
-            "chunk low-pass cutoff_hz must be between 0 and Nyquist "
-            f"({nyquist_hz:.6g} Hz), got {cutoff_hz}"
-        )
-
-    stop = mat.shape[1] if include_gripper else max(mat.shape[1] - 1, 0)
-    if stop == 0:
-        return mat.copy()
-    source = mat[:, :stop].astype(np.float64, copy=False)
-    sos = butter(order, cutoff_hz, btype='lowpass', fs=sample_rate_hz, output='sos')
-    # Bound padding by the short action horizon instead of relying on scipy's
-    # default, which can reject otherwise valid small chunks.
-    padlen = min(3 * (2 * len(sos) + 1), mat.shape[0] - 1)
-    filtered = sosfiltfilt(sos, source, axis=0, padlen=padlen)
-
-    if preserve_endpoints:
-        progress = np.linspace(0.0, 1.0, mat.shape[0], dtype=np.float64)[:, None]
-        filtered += (
-            (1.0 - progress) * (source[:1] - filtered[:1])
-            + progress * (source[-1:] - filtered[-1:])
-        )
-
-    if not np.all(np.isfinite(filtered)):
-        raise ValueError("chunk low-pass produced non-finite values")
-    out = mat.copy()
-    out[:, :stop] = filtered.astype(np.float32)
-    return out
-
-
-def lowpass_dual_action_chunks_zero_phase(
-    left_mat,
-    right_mat,
-    sample_rate_hz,
-    cutoff_hz,
-    order=4,
-    preserve_endpoints=True,
-    include_gripper=False,
-):
-    """Apply the same zero-phase low-pass independently to both arms."""
-    left_mat = np.asarray(left_mat, dtype=np.float32)
-    right_mat = np.asarray(right_mat, dtype=np.float32)
-    if (
-        left_mat.ndim != 2
-        or right_mat.ndim != 2
-        or left_mat.shape[0] != right_mat.shape[0]
-    ):
-        raise ValueError("left/right low-pass chunks must be aligned 2D matrices")
-    # Each arm owns a gripper column, so filter them separately to exclude both.
-    left_out = lowpass_action_chunk_zero_phase(
-        left_mat, sample_rate_hz, cutoff_hz, order,
-        preserve_endpoints, include_gripper,
-    )
-    right_out = lowpass_action_chunk_zero_phase(
-        right_mat, sample_rate_hz, cutoff_hz, order,
-        preserve_endpoints, include_gripper,
-    )
-    return left_out, right_out
-
-
-def _isotonic_nondecreasing_l2(values):
-    """Least-squares projection onto a nondecreasing sequence (PAVA)."""
-    values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 1:
-        raise ValueError("isotonic projection input must be one-dimensional")
-    block_values = []
-    block_weights = []
-    block_counts = []
-    for value in values:
-        block_values.append(float(value))
-        block_weights.append(1.0)
-        block_counts.append(1)
-        while (
-            len(block_values) >= 2
-            and block_values[-2] > block_values[-1]
-        ):
-            weight = block_weights[-2] + block_weights[-1]
-            block_values[-2] = (
-                block_values[-2] * block_weights[-2]
-                + block_values[-1] * block_weights[-1]
-            ) / weight
-            block_weights[-2] = weight
-            block_counts[-2] += block_counts[-1]
-            block_values.pop()
-            block_weights.pop()
-            block_counts.pop()
-    return np.concatenate([
-        np.full(count, value, dtype=np.float64)
-        for value, count in zip(block_values, block_counts)
-    ])
-
-
-def project_action_chunk_monotonic_to_endpoint(
-    mat,
-    start,
-    strength=1.0,
-    min_terminal_delta=1e-4,
-    include_gripper=False,
-):
-    """Suppress per-joint reversals while preserving the chunk endpoint."""
-    mat = np.asarray(mat, dtype=np.float32)
-    start = np.asarray(start, dtype=np.float32)
-    if mat.ndim != 2 or start.shape != (mat.shape[1],):
-        raise ValueError("monotonic chunk input/start shape mismatch")
-    if mat.shape[0] == 0:
-        return mat.copy()
-    strength = float(strength)
-    min_terminal_delta = max(float(min_terminal_delta), 0.0)
-    if not np.isfinite(strength) or not 0.0 <= strength <= 1.0:
-        raise ValueError("monotonic chunk strength must be in [0, 1]")
-    stop = mat.shape[1] if include_gripper else max(mat.shape[1] - 1, 0)
-    projected = mat.astype(np.float64, copy=True)
-    source = mat.astype(np.float64, copy=False)
-    start64 = start.astype(np.float64, copy=False)
-    for axis in range(stop):
-        endpoint = source[-1, axis]
-        terminal_delta = endpoint - start64[axis]
-        if abs(terminal_delta) <= min_terminal_delta:
-            projected[:, axis] = endpoint
-            continue
-        direction = 1.0 if terminal_delta > 0.0 else -1.0
-        terminal_progress = abs(terminal_delta)
-        progress = direction * (
-            np.concatenate(([start64[axis]], source[:, axis])) - start64[axis]
-        )
-        progress = np.clip(progress, 0.0, terminal_progress)
-        monotonic_progress = _isotonic_nondecreasing_l2(progress)
-        projected[:, axis] = (
-            start64[axis] + direction * monotonic_progress[1:]
-        )
-        # Endpoint preservation is exact, independent of floating-point pooling.
-        projected[-1, axis] = endpoint
-    out = source + strength * (projected - source)
-    out[-1, :stop] = source[-1, :stop]
-    if not np.all(np.isfinite(out)):
-        raise ValueError("monotonic chunk projection produced non-finite values")
-    return out.astype(np.float32)
-
-
-def linear_upsample_chunk(mat, factor):
-    mat = np.asarray(mat, dtype=np.float32)
-    if factor <= 1.0 or mat.shape[0] <= 1:
-        return mat
-
-    out_steps = max(int(round(mat.shape[0] * factor)), mat.shape[0])
-    src_pos = np.arange(out_steps, dtype=np.float32) / float(factor)
-    src_pos = np.clip(src_pos, 0.0, float(mat.shape[0] - 1))
-    lo = np.floor(src_pos).astype(np.int64)
-    hi = np.minimum(lo + 1, mat.shape[0] - 1)
-    alpha = (src_pos - lo).astype(np.float32)[:, None]
-    return (1.0 - alpha) * mat[lo] + alpha * mat[hi]
-
-
-def interpolate_with_segment_factors(mat, segment_factors):
-    mat = np.asarray(mat, dtype=np.float32)
-    if mat.shape[0] <= 1:
-        return mat.copy(), [0]
-
-    out = [mat[0]]
-    source_to_expanded = [0]
-    for idx, factor in enumerate(segment_factors):
-        factor = max(int(factor), 1)
-        start = mat[idx]
-        end = mat[idx + 1]
-        for step in range(1, factor + 1):
-            alpha = float(step) / float(factor)
-            out.append((1.0 - alpha) * start + alpha * end)
-        source_to_expanded.append(len(out) - 1)
-    return np.asarray(out, dtype=np.float32), source_to_expanded
-
-
-def adaptive_delta_upsample_chunks(left_mat, right_mat, min_factor, max_factor, joint_threshold):
-    left_mat = np.asarray(left_mat, dtype=np.float32)
-    right_mat = np.asarray(right_mat, dtype=np.float32)
-    if left_mat.shape[0] <= 1:
-        return left_mat.copy(), right_mat.copy(), [0], []
-
-    threshold = np.asarray(joint_threshold, dtype=np.float32)
-    if threshold.shape[0] == left_mat.shape[1] + right_mat.shape[1]:
-        threshold_left = threshold[: left_mat.shape[1]]
-        threshold_right = threshold[left_mat.shape[1] :]
-    elif threshold.shape[0] == left_mat.shape[1]:
-        threshold_left = threshold
-        threshold_right = threshold
-    else:
-        raise ValueError(
-            "chunk_interpolation.joint_threshold must have 7 values or 14 values "
-            f"for the current action shape, got {threshold.shape[0]}"
-        )
-    threshold_left = np.maximum(threshold_left, 1e-6)
-    threshold_right = np.maximum(threshold_right, 1e-6)
-
-    segment_factors = []
-    for idx in range(left_mat.shape[0] - 1):
-        left_score = np.max(np.abs(left_mat[idx + 1] - left_mat[idx]) / threshold_left)
-        right_score = np.max(np.abs(right_mat[idx + 1] - right_mat[idx]) / threshold_right)
-        factor = int(np.ceil(max(float(left_score), float(right_score))))
-        factor = min(max(factor, int(min_factor)), int(max_factor))
-        segment_factors.append(max(factor, 1))
-
-    left_out, source_to_expanded = interpolate_with_segment_factors(left_mat, segment_factors)
-    right_out, _ = interpolate_with_segment_factors(right_mat, segment_factors)
-    return left_out, right_out, source_to_expanded, segment_factors
-
-
-def split_joint_threshold(joint_threshold, left_dim, right_dim):
-    threshold = np.asarray(joint_threshold, dtype=np.float32)
-    if threshold.shape[0] == left_dim + right_dim:
-        threshold_left = threshold[:left_dim]
-        threshold_right = threshold[left_dim:]
-    elif threshold.shape[0] == left_dim:
-        threshold_left = threshold
-        threshold_right = threshold
-    else:
-        raise ValueError(
-            "chunk_interpolation.joint_threshold must have 7 values or 14 values "
-            f"for the current action shape, got {threshold.shape[0]}"
-        )
-    return np.maximum(threshold_left, 1e-6), np.maximum(threshold_right, 1e-6)
-
-
-def interpolate_arm_command_keep_gripper(start, target, alpha):
-    """Linearly interpolate arm axes while applying the gripper target immediately."""
-    start = np.asarray(start, dtype=np.float32)
-    target = np.asarray(target, dtype=np.float32)
-    if start.shape != target.shape:
-        raise ValueError("command interpolation endpoints must have matching shapes")
-    out = target.copy()
-    if out.shape[0] > 1:
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-        out[:-1] = start[:-1] + alpha * (target[:-1] - start[:-1])
-    return out
-
-
-def adaptive_bridge_to_first_action(
-    left_mat,
-    right_mat,
-    command_left,
-    command_right,
-    min_factor,
-    max_factor,
-    joint_threshold,
-    source_to_expanded,
-):
-    if left_mat.shape[0] == 0:
-        return left_mat, right_mat, source_to_expanded, 1
-
-    threshold_left, threshold_right = split_joint_threshold(
-        joint_threshold,
-        left_mat.shape[1],
-        right_mat.shape[1],
-    )
-    left_score = np.max(np.abs(left_mat[0] - command_left) / threshold_left)
-    right_score = np.max(np.abs(right_mat[0] - command_right) / threshold_right)
-    factor = int(np.ceil(max(float(left_score), float(right_score))))
-    factor = min(max(factor, int(min_factor)), int(max_factor))
-    factor = max(factor, 1)
-    if factor <= 1:
-        return left_mat, right_mat, source_to_expanded, factor
-
-    left_bridge = []
-    right_bridge = []
-    for step in range(1, factor):
-        alpha = float(step) / float(factor)
-        left_step = interpolate_arm_command_keep_gripper(
-            command_left, left_mat[0], alpha
-        )
-        right_step = interpolate_arm_command_keep_gripper(
-            command_right, right_mat[0], alpha
-        )
-        left_bridge.append(left_step)
-        right_bridge.append(right_step)
-    left_out = np.vstack([np.asarray(left_bridge, dtype=np.float32), left_mat])
-    right_out = np.vstack([np.asarray(right_bridge, dtype=np.float32), right_mat])
-    offset = factor - 1
-    source_to_expanded = [idx + offset for idx in source_to_expanded]
-    return left_out, right_out, source_to_expanded, factor
-
-
-def exponential_temporal_ensemble(
-    chunk_history,
-    action_step,
-    current_request_id,
-    decay,
-    max_candidate_age,
-    min_candidate_action_index=0,
-):
-    candidates = []
-    for chunk in chunk_history:
-        rel_step = action_step - chunk['start_step']
-        if rel_step < 0 or rel_step >= chunk['left'].shape[0]:
-            continue
-        if rel_step < min_candidate_action_index:
-            continue
-        age = current_request_id - chunk['request_id']
-        if max_candidate_age is not None and age > max_candidate_age:
-            continue
-        weight = float(np.exp(-decay * max(age, 0)))
-        candidates.append((weight, chunk['left'][rel_step], chunk['right'][rel_step]))
-
-    if not candidates:
-        return None, None, 0, []
-
-    weights = np.asarray([item[0] for item in candidates], dtype=np.float32)
-    weights = weights / max(float(weights.sum()), 1e-8)
-    left = np.zeros_like(candidates[0][1], dtype=np.float32)
-    right = np.zeros_like(candidates[0][2], dtype=np.float32)
-    for weight, (_, left_candidate, right_candidate) in zip(weights, candidates):
-        left += weight * left_candidate
-        right += weight * right_candidate
-    return left, right, len(candidates), weights.tolist()
-
-
-def vector_to_json(values):
-    if values is None:
-        return ''
-    return json.dumps(np.asarray(values, dtype=np.float32).tolist(), separators=(',', ':'))
-
-
-def norm_first_six(values):
-    if values is None:
-        return ''
-    arr = np.asarray(values, dtype=np.float32)
-    return f'{float(np.linalg.norm(arr[:6])):.6f}'
-
-
-def make_action_logger(cfg, rate_hz):
-    log_cfg = cfg['ros'].get('action_log', {})
-    if not bool(log_cfg.get('enabled', False)):
-        return None, None
-
-    log_dir = os.path.expanduser(log_cfg.get('dir', 'logs/action_commands'))
-    os.makedirs(log_dir, exist_ok=True)
-    stamp = time.strftime('%Y%m%d_%H%M%S')
-    path = os.path.join(log_dir, f'action_commands_{stamp}.csv')
-    flush_every = max(int(log_cfg.get('flush_every_rows', 1)), 1)
-    rich_cfg = log_cfg.get('rich', {})
-    rich_enabled = bool(rich_cfg.get('enabled', False))
-    save_request_images = rich_enabled and bool(rich_cfg.get('save_request_images', True))
-    save_action_chunks = rich_enabled and bool(rich_cfg.get('save_action_chunks', True))
-    request_snapshot_every_n = max(int(rich_cfg.get('request_snapshot_every_n', 1)), 1)
-    request_snapshot_dir = None
-    if save_request_images:
-        request_snapshot_dir = os.path.join(log_dir, f'request_snapshots_{stamp}')
-        os.makedirs(request_snapshot_dir, exist_ok=True)
-    action_chunk_dir = None
-    if save_action_chunks:
-        action_chunk_dir = os.path.join(log_dir, f'action_chunks_{stamp}')
-        os.makedirs(action_chunk_dir, exist_ok=True)
-
-    columns = [
-        'wall_time',
-        'ros_time',
-        'request_id',
-        'tau',
-        'global_action_step',
-        'chunk_start_step',
-        'action_index',
-        'policy_latency_sec',
-        'policy_latency_steps',
-        'chunk_size',
-        'received_chunk_size',
-        'steps_to_execute',
-        'discarded_steps',
-        'rate_hz',
-        'command_publish_rate_hz',
-        'command_publish_substeps',
-        'task_prompt',
-        'action_mode',
-        'chunk_interpolation_enabled',
-        'chunk_interpolation_mode',
-        'chunk_interpolation_factor',
-        'request_obs_seq',
-        'request_obs_age_sec',
-        'request_snapshot_dir',
-        'action_chunk_path',
-        'rollout_sample_dir',
-        'rollout_action_path',
-        'request_fresh_camera_count',
-        'request_fresh_camera_forced',
-        'delta_clip_enabled',
-        'delta_clip_reference',
-        'command_delta_deadband_enabled',
-        'first_action_delta_scale_enabled',
-        'first_action_delta_scale_coefficient',
-        'first_action_delta_scale_include_gripper',
-        'first_action_delta_scale_applied',
-        'initial_pose_delta_override_enabled',
-        'initial_pose_delta_override_arms',
-        'initial_pose_delta_override_include_gripper',
-        'temporal_ensemble_count',
-        'temporal_ensemble_weights',
-        'current_left',
-        'current_right',
-        'request_measured_left',
-        'request_measured_right',
-        'publish_current_left',
-        'publish_current_right',
-        'clip_reference_left',
-        'clip_reference_right',
-        'command_left_before',
-        'command_right_before',
-        'raw_left',
-        'raw_right',
-        'ensembled_left',
-        'ensembled_right',
-        'filtered_left',
-        'filtered_right',
-        'target_left',
-        'target_right',
-        'ik_seed_joint_left',
-        'ik_seed_joint_right',
-        'ik_diagnostics_left',
-        'ik_diagnostics_right',
-        'ik_joint_left',
-        'ik_joint_right',
-        'ik_left_position_error_m',
-        'ik_right_position_error_m',
-        'ik_left_orientation_error_rad',
-        'ik_right_orientation_error_rad',
-        'raw_delta_left',
-        'raw_delta_right',
-        'applied_delta_left',
-        'applied_delta_right',
-        'reference_delta_left',
-        'reference_delta_right',
-        'tracking_error_before_left',
-        'tracking_error_before_right',
-        'tracking_error_after_left',
-        'tracking_error_after_right',
-        'clip_residual_left',
-        'clip_residual_right',
-        'command_delta_deadband_residual_left',
-        'command_delta_deadband_residual_right',
-        'raw_vs_publish_norm_left',
-        'raw_vs_publish_norm_right',
-        'ensembled_vs_publish_norm_left',
-        'ensembled_vs_publish_norm_right',
-        'target_vs_publish_norm_left',
-        'target_vs_publish_norm_right',
-        'reference_delta_norm_left',
-        'reference_delta_norm_right',
-        'applied_delta_norm_left',
-        'applied_delta_norm_right',
-        'tracking_error_before_norm_left',
-        'tracking_error_before_norm_right',
-        'tracking_error_after_norm_left',
-        'tracking_error_after_norm_right',
-        'clip_residual_norm_left',
-        'clip_residual_norm_right',
-        'command_delta_deadband_residual_norm_left',
-        'command_delta_deadband_residual_norm_right',
-        'publish_joint_age_left_sec',
-        'publish_joint_age_right_sec',
-        'policy_gripper_input_mode',
-        'left_gripper_request_measured',
-        'left_gripper_request_policy',
-        'left_gripper_request_commanded',
-        'right_gripper_request_measured',
-        'right_gripper_request_policy',
-        'right_gripper_request_commanded',
-        'left_gripper_publish',
-        'left_gripper_raw',
-        'left_gripper_ensembled',
-        'left_gripper_target',
-        'right_gripper_publish',
-        'right_gripper_raw',
-        'right_gripper_ensembled',
-        'right_gripper_target',
-        'gripper_hysteresis',
-        'base_vel',
-    ]
-    f = open(path, 'w', newline='', encoding='utf-8')
-    writer = csv.DictWriter(f, fieldnames=columns, extrasaction='ignore')
-    writer.writeheader()
-    rospy.loginfo(f"Action command logging enabled: {path} (flush_every_rows={flush_every})")
-    return {
-        'file': f,
-        'writer': writer,
-        'path': path,
-        'flush_every': flush_every,
-        'rows_since_flush': 0,
-        'rich_enabled': rich_enabled,
-        'save_request_images': save_request_images,
-        'save_action_chunks': save_action_chunks,
-        'request_snapshot_every_n': request_snapshot_every_n,
-        'request_snapshot_dir': request_snapshot_dir,
-        'action_chunk_dir': action_chunk_dir,
-        'request_snapshot_count': 0,
-    }, path
-
-
-def write_action_log(logger, row):
-    if logger is None:
-        return
-    logger['writer'].writerow(row)
-    logger['rows_since_flush'] += 1
-    if logger['rows_since_flush'] >= logger['flush_every']:
-        logger['file'].flush()
-        logger['rows_since_flush'] = 0
-
-
-def save_request_snapshot(logger, request_step, pkt, header, fresh_camera_count, forced_fresh_fallback):
-    if logger is None or not logger.get('save_request_images'):
-        return ''
-    logger['request_snapshot_count'] += 1
-    if (logger['request_snapshot_count'] - 1) % logger['request_snapshot_every_n'] != 0:
-        return ''
-
-    root = logger.get('request_snapshot_dir')
-    if not root:
-        return ''
-    name = f"step_{int(request_step):06d}_req_{logger['request_snapshot_count']:06d}"
-    out_dir = os.path.join(root, name)
-    os.makedirs(out_dir, exist_ok=True)
-    for key in ('front', 'left', 'right'):
-        with open(os.path.join(out_dir, f'{key}.jpg'), 'wb') as f:
-            f.write(pkt[key])
-    now = time.monotonic()
-    meta = {
-        'wall_time': time.time(),
-        'request_step': int(request_step),
-        'fresh_camera_count': int(fresh_camera_count),
-        'forced_fresh_fallback': bool(forced_fresh_fallback),
-        'header': header,
-        'obs_seq': dict(pkt.get('obs_seq', {})),
-        'obs_age_sec': {
-            key: None if value is None else now - value
-            for key, value in pkt.get('obs_time', {}).items()
-        },
-    }
-    with open(os.path.join(out_dir, 'metadata.json'), 'w', encoding='utf-8') as f:
-        json.dump(meta, f, indent=2)
-    return out_dir
-
-
-def save_action_chunk(logger, request_id, chunk):
-    if logger is None or not logger.get('save_action_chunks'):
-        return ''
-    root = logger.get('action_chunk_dir')
-    if not root:
-        return ''
-    path = os.path.join(root, f"request_{int(request_id):06d}.npz")
-    meta = {
-        'request_id': int(request_id),
-        'start_step': int(chunk['start_step']),
-        'received_chunk_size': int(chunk['received_chunk_size']),
-        'processed_chunk_size': int(chunk['left'].shape[0]),
-        'steps_to_execute': int(chunk['steps_to_execute']),
-        'overlap_steps': None if chunk['overlap_steps'] is None else int(chunk['overlap_steps']),
-        'policy_latency_sec': float(chunk['policy_latency_sec']),
-        'policy_latency_steps': int(chunk['policy_latency_steps']),
-        'request_fresh_camera_count': int(chunk['request_fresh_camera_count']),
-        'request_fresh_camera_forced': bool(chunk['request_fresh_camera_forced']),
-        'request_obs_seq': dict(chunk['request_obs_seq']),
-        'request_snapshot_dir': chunk.get('request_snapshot_dir', ''),
-        'policy_gripper_input': dict(chunk.get('policy_gripper_input', {})),
-        'terminal_filter_enabled': bool(chunk.get('terminal_filter_enabled', False)),
-        'terminal_endpoint_index': int(chunk.get('terminal_endpoint_index', -1)),
-        'terminal_delta_left': np.asarray(chunk.get('terminal_delta_left', []), dtype=np.float32).tolist(),
-        'terminal_delta_right': np.asarray(chunk.get('terminal_delta_right', []), dtype=np.float32).tolist(),
-        'terminal_cancel_left': np.asarray(chunk.get('terminal_cancel_left', []), dtype=bool).tolist(),
-        'terminal_cancel_right': np.asarray(chunk.get('terminal_cancel_right', []), dtype=bool).tolist(),
-        'initial_pose_delta_override_enabled': bool(
-            chunk.get('initial_pose_delta_override_enabled', False)
-        ),
-        'initial_pose_delta_override_arms': list(
-            chunk.get('initial_pose_delta_override_arms', [])
-        ),
-        'initial_pose_delta_override_include_gripper': bool(
-            chunk.get('initial_pose_delta_override_include_gripper', False)
-        ),
-        'first_action_delta_scale_enabled': bool(
-            chunk.get('first_action_delta_scale_enabled', False)
-        ),
-        'first_action_delta_scale_coefficient': float(
-            chunk.get('first_action_delta_scale_coefficient', 1.0)
-        ),
-        'first_action_delta_scale_include_gripper': bool(
-            chunk.get('first_action_delta_scale_include_gripper', False)
-        ),
-        'initial_bridge_factor': int(chunk.get('initial_bridge_factor', 1)),
-        'initial_bridge_added_steps': int(
-            chunk.get('initial_bridge_added_steps', 0)
-        ),
-        'chunk_lowpass_enabled': bool(chunk.get('chunk_lowpass_enabled', False)),
-        'chunk_lowpass_cutoff_hz': float(
-            chunk.get('chunk_lowpass_cutoff_hz', 0.0)
-        ),
-        'chunk_lowpass_sample_rate_hz': float(
-            chunk.get('chunk_lowpass_sample_rate_hz', 0.0)
-        ),
-        'chunk_lowpass_order': int(chunk.get('chunk_lowpass_order', 0)),
-        'chunk_lowpass_preserve_endpoints': bool(
-            chunk.get('chunk_lowpass_preserve_endpoints', False)
-        ),
-        'chunk_monotonic_enabled': bool(
-            chunk.get('chunk_monotonic_enabled', False)
-        ),
-        'chunk_monotonic_arms': list(chunk.get('chunk_monotonic_arms', [])),
-        'chunk_monotonic_strength': float(
-            chunk.get('chunk_monotonic_strength', 0.0)
-        ),
-        'chunk_monotonic_min_terminal_delta': float(
-            chunk.get('chunk_monotonic_min_terminal_delta', 0.0)
-        ),
-    }
-    np.savez_compressed(
-        path,
-        processed_left=chunk['left'],
-        processed_right=chunk['right'],
-        received_left=chunk.get('received_left', chunk['left']),
-        received_right=chunk.get('received_right', chunk['right']),
-        lowpass_left=chunk.get('lowpass_left', chunk['left']),
-        lowpass_right=chunk.get('lowpass_right', chunk['right']),
-        monotonic_left=chunk.get('monotonic_left', chunk['left']),
-        monotonic_right=chunk.get('monotonic_right', chunk['right']),
-        model_raw_left=np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_left') is None else chunk['model_raw_left'],
-        model_raw_right=np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_right') is None else chunk['model_raw_right'],
-        vel=np.empty((0, 0), dtype=np.float32) if chunk['vel'] is None else chunk['vel'],
-        request_current_left=chunk['request_current_left'],
-        request_current_right=chunk['request_current_right'],
-        request_measured_left=chunk.get('request_measured_left', chunk['request_current_left']),
-        request_measured_right=chunk.get('request_measured_right', chunk['request_current_right']),
-        terminal_delta_left=np.asarray(chunk.get('terminal_delta_left', []), dtype=np.float32),
-        terminal_delta_right=np.asarray(chunk.get('terminal_delta_right', []), dtype=np.float32),
-        terminal_cancel_left=np.asarray(chunk.get('terminal_cancel_left', []), dtype=bool),
-        terminal_cancel_right=np.asarray(chunk.get('terminal_cancel_right', []), dtype=bool),
-        meta=json.dumps(meta, separators=(',', ':')),
-    )
-    return path
-
-
-def make_rollout_dataset_logger(cfg, rate_hz):
-    rollout_cfg = cfg['ros'].get('rollout_dataset', {})
-    if not bool(rollout_cfg.get('enabled', False)):
-        return None
-
-    root = os.path.expanduser(rollout_cfg.get('dir', '/workspace/project/cobotmagic_datasets'))
-    os.makedirs(root, exist_ok=True)
-    stamp = time.strftime('%Y%m%d_%H%M%S')
-    run_name = rollout_cfg.get('run_name') or f'rollout_{stamp}'
-    episode_dir = os.path.join(root, run_name)
-    suffix = 1
-    while os.path.exists(episode_dir):
-        episode_dir = os.path.join(root, f'{run_name}_{suffix:02d}')
-        suffix += 1
-    os.makedirs(episode_dir, exist_ok=False)
-    dataset_format = str(rollout_cfg.get('format', 'hdf5')).lower()
-    if dataset_format not in ('hdf5', 'directory'):
-        rospy.logwarn(f"Unsupported rollout_dataset.format={dataset_format!r}; using 'hdf5'.")
-        dataset_format = 'hdf5'
-    samples_dir = os.path.join(episode_dir, 'samples')
-    if dataset_format == 'directory':
-        os.makedirs(samples_dir, exist_ok=False)
-
-    meta = {
-        'created_wall_time': time.time(),
-        'created_stamp': stamp,
-        'rate_hz': int(rate_hz),
-        'task_prompt': cfg.get('task_prompt', ''),
-        'policy_backend': cfg.get('policy_backend', ''),
-        'openvla': cfg.get('openvla', {}),
-        'ros': {
-            'action_mode': cfg['ros'].get('action_mode'),
-            'open_loop_steps': cfg['ros'].get('open_loop_steps'),
-            'rate_hz': cfg['ros'].get('rate_hz'),
-            'command_publish': cfg['ros'].get('command_publish', {}),
-            'chunk_interpolation': cfg['ros'].get('chunk_interpolation', {}),
-            'delta_clip': cfg['ros'].get('delta_clip', {}),
-            'action_filter': cfg['ros'].get('action_filter', {}),
-            'temporal_ensemble': cfg['ros'].get('temporal_ensemble', {}),
-        },
-        'format': {
-            'type': dataset_format,
-            'hdf5': 'episode.hdf5 with /samples/sample_XXXXXX groups',
-            'directory': 'samples/sample_XXXXXX with jpg/json/npz files',
-            'raw_action_definition': 'raw_left_chunk/raw_right_chunk are policy server outputs before bridge filters, clipping, thresholding, ensemble, and command blocking.',
-        },
-        'outcome': 'unknown',
-    }
-    with open(os.path.join(episode_dir, 'episode_metadata.json'), 'w', encoding='utf-8') as f:
-        json.dump(meta, f, indent=2)
-
-    h5_file = None
-    h5_path = ''
-    if dataset_format == 'hdf5':
-        try:
-            import h5py
-
-            h5_path = os.path.join(episode_dir, 'episode.hdf5')
-            h5_file = h5py.File(h5_path, 'w')
-            h5_file.attrs['metadata_json'] = json.dumps(meta, separators=(',', ':'))
-            h5_file.attrs['created_wall_time'] = meta['created_wall_time']
-            h5_file.attrs['task_prompt'] = meta['task_prompt']
-            h5_file.attrs['outcome'] = meta['outcome']
-            h5_file.create_group('samples')
-            h5_file.flush()
-        except Exception as exc:  # noqa: BLE001
-            rospy.logwarn(f"Failed to create rollout HDF5 file; falling back to directory format: {exc}")
-            dataset_format = 'directory'
-            samples_dir = os.path.join(episode_dir, 'samples')
-            os.makedirs(samples_dir, exist_ok=True)
-
-    rospy.loginfo(f"Rollout dataset logging enabled: {episode_dir} format={dataset_format}")
-    return {
-        'episode_dir': episode_dir,
-        'samples_dir': samples_dir,
-        'format': dataset_format,
-        'h5_file': h5_file,
-        'h5_path': h5_path,
-        'sample_count': 0,
-        'save_images': bool(rollout_cfg.get('save_images', True)),
-    }
-
-
-def h5_write_dataset(group, name, data, **kwargs):
-    if name in group:
-        del group[name]
-    group.create_dataset(name, data=data, **kwargs)
-
-
-def h5_write_json(group, name, payload):
-    h5_write_dataset(group, name, np.bytes_(json.dumps(payload, separators=(',', ':'))))
-
-
-def h5_write_jpeg(group, name, payload):
-    h5_write_dataset(group, name, np.frombuffer(payload, dtype=np.uint8), compression='gzip')
-
-
-def save_rollout_observation(logger, request_step, pkt, header, fresh_camera_count, forced_fresh_fallback):
-    if logger is None:
-        return ''
-
-    logger['sample_count'] += 1
-    sample_name = f"sample_{logger['sample_count']:06d}"
-
-    now = time.monotonic()
-    obs_age_sec = {
-        key: None if value is None else now - value
-        for key, value in pkt.get('obs_time', {}).items()
-    }
-    meta = {
-        'sample_id': logger['sample_count'],
-        'wall_time': time.time(),
-        'request_step': int(request_step),
-        'task_prompt': pkt['task_prompt'],
-        'fresh_camera_count': int(fresh_camera_count),
-        'forced_fresh_fallback': bool(forced_fresh_fallback),
-        'header': header,
-        'obs_seq': dict(pkt.get('obs_seq', {})),
-        'obs_age_sec': obs_age_sec,
-    }
-
-    if logger.get('format') == 'hdf5' and logger.get('h5_file') is not None:
-        h5_file = logger['h5_file']
-        group_path = f"samples/{sample_name}"
-        sample_group = h5_file.create_group(group_path)
-        sample_group.attrs['sample_id'] = logger['sample_count']
-        sample_group.attrs['request_step'] = int(request_step)
-        sample_group.attrs['wall_time'] = meta['wall_time']
-        sample_group.attrs['task_prompt'] = pkt['task_prompt']
-        sample_group.attrs['metadata_json'] = json.dumps(meta, separators=(',', ':'))
-        obs_group = sample_group.create_group('observation')
-        h5_write_dataset(obs_group, 'jleft', np.asarray(pkt['jleft'], dtype=np.float32))
-        h5_write_dataset(obs_group, 'jright', np.asarray(pkt['jright'], dtype=np.float32))
-        h5_write_dataset(
-            obs_group,
-            'odom',
-            np.empty((0,), dtype=np.float32) if pkt.get('odom') is None else np.asarray(pkt['odom'], dtype=np.float32),
-        )
-        h5_write_json(obs_group, 'metadata_json', meta)
-        h5_write_json(obs_group, 'obs_seq_json', pkt.get('obs_seq', {}))
-        h5_write_json(obs_group, 'obs_age_sec_json', obs_age_sec)
-        if logger.get('save_images', True):
-            img_group = obs_group.create_group('images')
-            for key in ('front', 'left', 'right'):
-                h5_write_jpeg(img_group, f'{key}_jpg', pkt[key])
-        h5_file.flush()
-        return f"{logger['h5_path']}::/{group_path}"
-
-    sample_dir = os.path.join(logger['samples_dir'], sample_name)
-    os.makedirs(sample_dir, exist_ok=False)
-    if logger.get('save_images', True):
-        for key in ('front', 'left', 'right'):
-            with open(os.path.join(sample_dir, f'{key}.jpg'), 'wb') as f:
-                f.write(pkt[key])
-    with open(os.path.join(sample_dir, 'observation.json'), 'w', encoding='utf-8') as f:
-        json.dump(meta, f, indent=2)
-    np.savez_compressed(
-        os.path.join(sample_dir, 'observation.npz'),
-        jleft=np.asarray(pkt['jleft'], dtype=np.float32),
-        jright=np.asarray(pkt['jright'], dtype=np.float32),
-        odom=np.empty((0,), dtype=np.float32) if pkt.get('odom') is None else np.asarray(pkt['odom'], dtype=np.float32),
-        obs_seq=json.dumps(pkt.get('obs_seq', {}), separators=(',', ':')),
-        obs_age_sec=json.dumps(obs_age_sec, separators=(',', ':')),
-    )
-    return sample_dir
-
-
-def save_rollout_action(logger, sample_dir, request_id, chunk):
-    if logger is None or not sample_dir:
-        return ''
-
-    meta = {
-        'request_id': int(request_id),
-        'start_step': int(chunk['start_step']),
-        'received_chunk_size': int(chunk['received_chunk_size']),
-        'processed_chunk_size': int(chunk['left'].shape[0]),
-        'steps_to_execute': int(chunk['steps_to_execute']),
-        'overlap_steps': None if chunk['overlap_steps'] is None else int(chunk['overlap_steps']),
-        'policy_latency_sec': float(chunk['policy_latency_sec']),
-        'policy_latency_steps': int(chunk['policy_latency_steps']),
-        'request_fresh_camera_count': int(chunk['request_fresh_camera_count']),
-        'request_fresh_camera_forced': bool(chunk['request_fresh_camera_forced']),
-        'raw_action_definition': (
-            'raw_left_chunk/raw_right_chunk are the policy server outputs as received by the bridge, '
-            'before bridge-side interpolation, filters, clipping, thresholding, temporal ensemble, '
-            'right-arm blocking, and command publish logic.'
-        ),
-        'model_raw_action_definition': (
-            'model_raw_left_chunk/model_raw_right_chunk are the direct OpenVLA action-head outputs '
-            'before server-side action_delta_gripper_abs postprocessing when the server provides them; '
-            'empty arrays mean the server did not provide model raw action frames.'
-        ),
-    }
-
-    if logger.get('format') == 'hdf5' and logger.get('h5_file') is not None:
-        marker = '::/'
-        if marker not in sample_dir:
-            return ''
-        group_path = sample_dir.split(marker, 1)[1].lstrip('/')
-        h5_file = logger['h5_file']
-        sample_group = h5_file[group_path]
-        action_group = sample_group.create_group('actions')
-        action_group.attrs['request_id'] = int(request_id)
-        action_group.attrs['metadata_json'] = json.dumps(meta, separators=(',', ':'))
-        h5_write_dataset(action_group, 'raw_left_chunk', chunk.get('received_left', chunk['left']), compression='gzip')
-        h5_write_dataset(action_group, 'raw_right_chunk', chunk.get('received_right', chunk['right']), compression='gzip')
-        h5_write_dataset(
-            action_group,
-            'model_raw_left_chunk',
-            np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_left') is None else chunk['model_raw_left'],
-            compression='gzip',
-        )
-        h5_write_dataset(
-            action_group,
-            'model_raw_right_chunk',
-            np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_right') is None else chunk['model_raw_right'],
-            compression='gzip',
-        )
-        h5_write_dataset(action_group, 'processed_left_chunk', chunk['left'], compression='gzip')
-        h5_write_dataset(action_group, 'processed_right_chunk', chunk['right'], compression='gzip')
-        h5_write_dataset(
-            action_group,
-            'vel',
-            np.empty((0, 0), dtype=np.float32) if chunk['vel'] is None else chunk['vel'],
-            compression='gzip',
-        )
-        h5_write_dataset(action_group, 'request_current_left', chunk['request_current_left'])
-        h5_write_dataset(action_group, 'request_current_right', chunk['request_current_right'])
-        h5_write_json(action_group, 'metadata_json', meta)
-        h5_file.flush()
-        return f"{logger['h5_path']}::/{group_path}/actions"
-
-    action_path = os.path.join(sample_dir, 'actions.npz')
-    with open(os.path.join(sample_dir, 'action_metadata.json'), 'w', encoding='utf-8') as f:
-        json.dump(meta, f, indent=2)
-    np.savez_compressed(
-        action_path,
-        raw_left_chunk=chunk.get('received_left', chunk['left']),
-        raw_right_chunk=chunk.get('received_right', chunk['right']),
-        model_raw_left_chunk=np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_left') is None else chunk['model_raw_left'],
-        model_raw_right_chunk=np.empty((0, 0), dtype=np.float32) if chunk.get('model_raw_right') is None else chunk['model_raw_right'],
-        processed_left_chunk=chunk['left'],
-        processed_right_chunk=chunk['right'],
-        vel=np.empty((0, 0), dtype=np.float32) if chunk['vel'] is None else chunk['vel'],
-        request_current_left=chunk['request_current_left'],
-        request_current_right=chunk['request_current_right'],
-        meta=json.dumps(meta, separators=(',', ':')),
-    )
-    return action_path
-
-
-def policy_socket_kind(name):
-    normalized = name.lower()
-    if normalized == 'pair':
-        return zmq.PAIR
-    if normalized == 'req':
-        return zmq.REQ
-    raise ValueError(f"Unsupported zmq.socket_type={name!r}; expected 'pair' or 'req'.")
-
-
 def make_policy_socket(ctx, connect_addr, timeout_ms, socket_type):
-    sock = ctx.socket(policy_socket_kind(socket_type))
+    sock = ctx.socket(client_socket_kind(socket_type))
     sock.connect(connect_addr)
     sock.setsockopt(zmq.LINGER, 0)
     sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
@@ -1462,30 +238,6 @@ def publish_joint_pair(pub_l, pub_r, name_list, left_pos, right_pos):
     msg_right.header.stamp = stamp
     msg_right.name = name_list
     msg_right.position = right_pos.tolist()
-    pub_r.publish(msg_right)
-
-
-def publish_eef_pair(pub_l, pub_r, left_cmd, right_cmd):
-    if pub_l is None or pub_r is None:
-        raise RuntimeError("EEF publishers are not initialized")
-    msg_left = PosCmd()
-    msg_left.x = float(left_cmd[0])
-    msg_left.y = float(left_cmd[1])
-    msg_left.z = float(left_cmd[2])
-    msg_left.roll = float(left_cmd[3])
-    msg_left.pitch = float(left_cmd[4])
-    msg_left.yaw = float(left_cmd[5])
-    msg_left.gripper = float(left_cmd[6])
-    pub_l.publish(msg_left)
-
-    msg_right = PosCmd()
-    msg_right.x = float(right_cmd[0])
-    msg_right.y = float(right_cmd[1])
-    msg_right.z = float(right_cmd[2])
-    msg_right.roll = float(right_cmd[3])
-    msg_right.pitch = float(right_cmd[4])
-    msg_right.yaw = float(right_cmd[5])
-    msg_right.gripper = float(right_cmd[6])
     pub_r.publish(msg_right)
 
 
@@ -1589,30 +341,17 @@ def move_to_home(
         for left_pos, right_pos in zip(left_traj, right_traj):
             publish_joint_pair(pub_l, pub_r, name_list, left_pos, right_pos)
             rate.sleep()
-        if settle:
-            return wait_for_home_settle(
-                pub_l,
-                pub_r,
-                name_list,
-                target_left,
-                target_right,
-                settle_rate_hz or rate_hz,
-                settle_tolerance,
-                settle_hold_sec,
-                settle_timeout_sec,
-            )
-        return True
+    else:
+        done = False
+        while not rospy.is_shutdown() and not done:
+            cur_left = step_towards(cur_left, target_left, step_lengths)
+            cur_right = step_towards(cur_right, target_right, step_lengths)
 
-    done = False
-    while not rospy.is_shutdown() and not done:
-        cur_left = step_towards(cur_left, target_left, step_lengths)
-        cur_right = step_towards(cur_right, target_right, step_lengths)
+            publish_joint_pair(pub_l, pub_r, name_list, cur_left, cur_right)
 
-        publish_joint_pair(pub_l, pub_r, name_list, cur_left, cur_right)
-
-        if np.allclose(cur_left, target_left, atol=1e-4) and np.allclose(cur_right, target_right, atol=1e-4):
-            done = True
-        rate.sleep()
+            if np.allclose(cur_left, target_left, atol=1e-4) and np.allclose(cur_right, target_right, atol=1e-4):
+                done = True
+            rate.sleep()
     if settle:
         return wait_for_home_settle(
             pub_l,
@@ -1628,6 +367,29 @@ def move_to_home(
     return True
 
 
+def home_motion_options(phase_cfg, home_cfg, default_rate_hz):
+    """Resolve home-motion options: phase value, then home_position value, then default."""
+    def option(key, default=None):
+        return phase_cfg.get(key, home_cfg.get(key, default))
+
+    mode = str(option('mode', 'step')).lower()
+    if mode not in ('step', 'linear'):
+        rospy.logwarn(f"Unsupported home_position mode={mode!r}; using 'step'.")
+        mode = 'step'
+    rate_hz = max(int(option('rate_hz', default_rate_hz)), 1)
+    return {
+        'rate_hz': rate_hz,
+        'mode': mode,
+        'num_steps': option('num_steps'),
+        'settle': bool(option('settle', True)),
+        'settle_tolerance': float(option('settle_tolerance', 0.04)),
+        'settle_hold_sec': float(option('settle_hold_sec', 0.5)),
+        'settle_timeout_sec': float(option('settle_timeout_sec', 8.0)),
+        'settle_rate_hz': max(int(option('settle_rate_hz', min(rate_hz, 50))), 1),
+        'gripper_move_start_fraction': option('gripper_move_start_fraction'),
+    }
+
+
 def execute_home_phase(
     pub_l,
     pub_r,
@@ -1635,34 +397,26 @@ def execute_home_phase(
     step_lengths,
     home_cfg,
     phase_cfg,
-    phase_index=0,
+    phase_index=None,
+    default_rate_hz=20,
 ):
+    """Move to one home target. ``phase_index=None`` is the single-target form."""
     target_left = np.array(phase_cfg['left'], dtype=np.float32)
     target_right = np.array(phase_cfg['right'], dtype=np.float32)
     if target_left.shape[0] != len(name_list) or target_right.shape[0] != len(name_list):
+        if phase_index is None:
+            raise ValueError("home_position left/right size does not match joint_names")
         rospy.logwarn(f"home_position phase {phase_index} size mismatch; skipping phase.")
         return False
 
-    phase_name = str(phase_cfg.get('name', f'phase_{phase_index}'))
-    mode = str(phase_cfg.get('mode', home_cfg.get('mode', 'step'))).lower()
-    if mode not in ('step', 'linear'):
-        rospy.logwarn(f"Unsupported home_position phase mode={mode!r}; using 'step'.")
-        mode = 'step'
-    rate_hz = max(int(phase_cfg.get('rate_hz', home_cfg.get('rate_hz', 20))), 1)
-    num_steps = phase_cfg.get('num_steps', home_cfg.get('num_steps'))
-    settle = bool(phase_cfg.get('settle', home_cfg.get('settle', True)))
-    settle_tolerance = float(phase_cfg.get('settle_tolerance', home_cfg.get('settle_tolerance', 0.04)))
-    settle_hold_sec = float(phase_cfg.get('settle_hold_sec', home_cfg.get('settle_hold_sec', 0.5)))
-    settle_timeout_sec = float(phase_cfg.get('settle_timeout_sec', home_cfg.get('settle_timeout_sec', 8.0)))
-    settle_rate_hz = max(
-        int(phase_cfg.get('settle_rate_hz', home_cfg.get('settle_rate_hz', min(rate_hz, 50)))),
-        1,
-    )
-
+    options = home_motion_options(phase_cfg, home_cfg, default_rate_hz)
+    if phase_index is None:
+        label = 'home'
+    else:
+        label = f"home phase {phase_index}:{phase_cfg.get('name', f'phase_{phase_index}')}"
     rospy.loginfo(
-        "Moving arms to home phase "
-        f"{phase_index}:{phase_name} mode={mode} rate={rate_hz}Hz "
-        f"num_steps={num_steps} settle={settle}."
+        f"Moving arms to {label} mode={options['mode']} rate={options['rate_hz']}Hz "
+        f"num_steps={options['num_steps']} settle={options['settle']}."
     )
     return move_to_home(
         pub_l,
@@ -1671,16 +425,7 @@ def execute_home_phase(
         target_left,
         target_right,
         step_lengths,
-        rate_hz,
-        mode=mode,
-        num_steps=num_steps,
-        settle=settle,
-        settle_tolerance=settle_tolerance,
-        settle_hold_sec=settle_hold_sec,
-        settle_timeout_sec=settle_timeout_sec,
-        settle_rate_hz=settle_rate_hz,
-        gripper_move_start_fraction=phase_cfg.get(
-            'gripper_move_start_fraction', home_cfg.get('gripper_move_start_fraction')),
+        **options,
     )
 
 
@@ -1719,8 +464,6 @@ def run_shutdown_safety(pub_l, pub_r, pub_v, enable_pub, name_list, cfg):
 
 
 def main():
-    global published_first_command
-
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', required=True, help='path to a backend-specific YAML config')
     args = ap.parse_args()
@@ -1734,12 +477,19 @@ def main():
     jpeg_quality = int(cfg['ros'].get('jpeg_quality', 80))
     rate_hz = int(cfg['ros'].get('rate_hz', 20))
     rate_hz = max(rate_hz, 1)
+    action_mode = cfg['ros'].get('action_mode', 'velocity').lower()
+    if action_mode not in ('velocity', 'absolute', 'eef_absolute'):
+        raise ValueError(f"ros.action_mode must be 'velocity', 'absolute', or 'eef_absolute', got {action_mode!r}")
+    eef_action_mode = action_mode == 'eef_absolute'
     command_publish_cfg = cfg['ros'].get('command_publish', {})
     command_publish_mode = command_publish_cfg.get('mode', 'direct').lower()
     if command_publish_mode not in ('direct', 'interpolated'):
         rospy.logwarn(
             f"Unsupported command_publish.mode={command_publish_mode!r}; using ACT-style 'direct'."
         )
+        command_publish_mode = 'direct'
+    if eef_action_mode and command_publish_mode != 'direct':
+        rospy.logwarn("eef_absolute only supports command_publish.mode='direct'; using direct.")
         command_publish_mode = 'direct'
     if command_publish_mode == 'direct':
         command_publish_rate_hz = float(rate_hz)
@@ -1759,16 +509,6 @@ def main():
     policy_response_timeout_sec = float(cfg['ros'].get('policy_response_timeout_sec', 5.0))
     max_joint_age_sec = float(cfg['ros'].get('max_joint_age_sec', 0.75))
     max_image_age_sec = float(cfg['ros'].get('max_image_age_sec', 2.0))
-    action_mode = cfg['ros'].get('action_mode', 'velocity').lower()
-    if action_mode not in ('velocity', 'absolute', 'eef_absolute'):
-        raise ValueError(f"ros.action_mode must be 'velocity', 'absolute', or 'eef_absolute', got {action_mode!r}")
-    eef_action_mode = action_mode == 'eef_absolute'
-    if eef_action_mode and command_publish_mode != 'direct':
-        rospy.logwarn("eef_absolute only supports command_publish.mode='direct'; using direct.")
-        command_publish_mode = 'direct'
-        command_publish_rate_hz = float(rate_hz)
-        command_publish_substeps = 1
-        command_publish_period_sec = 1.0 / command_publish_rate_hz
     open_loop_steps_cfg = cfg['ros'].get('open_loop_steps')
     open_loop_steps = None if open_loop_steps_cfg is None else max(int(open_loop_steps_cfg), 1)
     policy_request_cfg = cfg['ros'].get('policy_request', {})
@@ -1814,22 +554,14 @@ def main():
     )
     initial_pose_override_cfg = cfg['ros'].get('initial_pose_delta_override', {})
     initial_pose_override_enabled = bool(initial_pose_override_cfg.get('enabled', False))
-    initial_pose_override_arms_cfg = initial_pose_override_cfg.get('arms', [])
-    if isinstance(initial_pose_override_arms_cfg, str):
-        initial_pose_override_arms_cfg = [initial_pose_override_arms_cfg]
-    initial_pose_override_arms = {
-        str(arm).strip().lower() for arm in initial_pose_override_arms_cfg
-    }
-    if 'both' in initial_pose_override_arms:
-        initial_pose_override_arms.update(('left', 'right'))
-        initial_pose_override_arms.discard('both')
-    invalid_override_arms = initial_pose_override_arms - {'left', 'right'}
+    initial_pose_override_arms, invalid_override_arms = parse_arm_selection(
+        initial_pose_override_cfg.get('arms', [])
+    )
     if invalid_override_arms:
         rospy.logwarn(
             "initial_pose_delta_override.arms contains unsupported values "
             f"{sorted(invalid_override_arms)}; only left/right/both are accepted."
         )
-        initial_pose_override_arms -= invalid_override_arms
     if initial_pose_override_enabled and not initial_pose_override_arms:
         rospy.logwarn(
             "initial_pose_delta_override is enabled but arms is empty; disabling the override."
@@ -1916,16 +648,9 @@ def main():
         )
     chunk_monotonic_cfg = cfg['ros'].get('action_chunk_monotonic', {})
     chunk_monotonic_enabled = bool(chunk_monotonic_cfg.get('enabled', False))
-    chunk_monotonic_arms_cfg = chunk_monotonic_cfg.get('arms', ['left', 'right'])
-    if isinstance(chunk_monotonic_arms_cfg, str):
-        chunk_monotonic_arms_cfg = [chunk_monotonic_arms_cfg]
-    chunk_monotonic_arms = {
-        str(arm).strip().lower() for arm in chunk_monotonic_arms_cfg
-    }
-    if 'both' in chunk_monotonic_arms:
-        chunk_monotonic_arms.update(('left', 'right'))
-        chunk_monotonic_arms.discard('both')
-    invalid_monotonic_arms = chunk_monotonic_arms - {'left', 'right'}
+    chunk_monotonic_arms, invalid_monotonic_arms = parse_arm_selection(
+        chunk_monotonic_cfg.get('arms', ['left', 'right'])
+    )
     if invalid_monotonic_arms:
         raise ValueError(
             "action_chunk_monotonic.arms only accepts left/right/both; got "
@@ -2082,13 +807,7 @@ def main():
                     start_right, target_right, alpha
                 )
 
-                js = JointState()
-                js.header.stamp = rospy.Time.now()
-                js.name = name_list
-                js.position = publish_left.tolist()
-                pub_l.publish(js)
-                js.position = publish_right.tolist()
-                pub_r.publish(js)
+                publish_joint_pair(pub_l, pub_r, name_list, publish_left, publish_right)
                 if not published_first_command:
                     rospy.loginfo(
                         f"Published first command to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
@@ -2314,22 +1033,14 @@ def main():
                     if require_home_settle and not phase_ok:
                         break
             else:
-                home_ok = move_to_home(
+                home_ok = execute_home_phase(
                     pub_l,
                     pub_r,
                     name_list,
-                    np.array(home_cfg['left'], dtype=np.float32),
-                    np.array(home_cfg['right'], dtype=np.float32),
                     step_arr,
-                    max(int(home_cfg.get('rate_hz', rate_hz)), 1),
-                    mode=str(home_cfg.get('mode', 'step')).lower(),
-                    num_steps=home_cfg.get('num_steps'),
-                    gripper_move_start_fraction=home_cfg.get('gripper_move_start_fraction'),
-                    settle=bool(home_cfg.get('settle', True)),
-                    settle_tolerance=float(home_cfg.get('settle_tolerance', 0.04)),
-                    settle_hold_sec=float(home_cfg.get('settle_hold_sec', 0.5)),
-                    settle_timeout_sec=float(home_cfg.get('settle_timeout_sec', 8.0)),
-                    settle_rate_hz=max(int(home_cfg.get('settle_rate_hz', min(int(home_cfg.get('rate_hz', rate_hz)), 50))), 1),
+                    home_cfg,
+                    home_cfg,
+                    default_rate_hz=rate_hz,
                 )
             if require_home_settle and not home_ok:
                 rospy.logerr("Home position did not settle; stopping before policy inference.")
@@ -2538,7 +1249,7 @@ def main():
             'request_snapshot_dir': request_snapshot_dir,
             'rollout_sample_dir': rollout_sample_dir,
         }
-        last_request_camera_seq = tuple(pkt['obs_seq'][key] for key in ('front', 'left', 'right'))
+        last_request_camera_seq = tuple(pkt['obs_seq'][key] for key in CAMERA_KEYS)
         if forced_fresh_fallback:
             rospy.logwarn(
                 "Sending policy request before all cameras refreshed to avoid action starvation: "
@@ -2553,7 +1264,7 @@ def main():
         now = time.monotonic()
         stale = []
         if max_image_age_sec > 0.0:
-            for key in ('front', 'left', 'right'):
+            for key in CAMERA_KEYS:
                 age = None if pkt['obs_time'].get(key) is None else now - pkt['obs_time'][key]
                 if age is None or age > max_image_age_sec:
                     stale.append((key, age))
@@ -2992,34 +1703,8 @@ def main():
                     ensembled_target_right = ensemble_right
                     temporal_ensemble_count = ensemble_count
                     temporal_ensemble_weights = ensemble_weights
-            if action_filter_enabled:
-                if filtered_policy_left is None or filtered_policy_right is None:
-                    filtered_policy_left = command_left.copy()
-                    filtered_policy_right = command_right.copy()
-                filtered_policy_left = (
-                    action_filter_alpha * ensembled_target_left
-                    + (1.0 - action_filter_alpha) * filtered_policy_left
-                )
-                filtered_policy_right = (
-                    action_filter_alpha * ensembled_target_right
-                    + (1.0 - action_filter_alpha) * filtered_policy_right
-                )
-                filtered_target_left = filtered_policy_left.copy()
-                filtered_target_right = filtered_policy_right.copy()
-                small_left = np.abs(filtered_target_left - command_left) < action_deadband_left
-                small_right = np.abs(filtered_target_right - command_right) < action_deadband_right
-                filtered_target_left[small_left] = command_left[small_left]
-                filtered_target_right[small_right] = command_right[small_right]
-            else:
-                filtered_target_left = ensembled_target_left
-                filtered_target_right = ensembled_target_right
-            if delta_clip_enabled:
-                target_left = clip_joint_delta(clip_reference_left, filtered_target_left, delta_clip_left)
-                target_right = clip_joint_delta(clip_reference_right, filtered_target_right, delta_clip_right)
-            else:
-                target_left = filtered_target_left
-                target_right = filtered_target_right
         else:
+            # velocity mode: integrate joint velocities; the gripper stays absolute.
             integrated_left = integrated_left + active_chunk['left'][action_index] * dt
             integrated_right = integrated_right + active_chunk['right'][action_index] * dt
             integrated_left[-1] = active_chunk['left'][action_index, -1]
@@ -3028,33 +1713,34 @@ def main():
             raw_target_right = integrated_right
             ensembled_target_left = raw_target_left
             ensembled_target_right = raw_target_right
-            if action_filter_enabled:
-                if filtered_policy_left is None or filtered_policy_right is None:
-                    filtered_policy_left = command_left.copy()
-                    filtered_policy_right = command_right.copy()
-                filtered_policy_left = (
-                    action_filter_alpha * ensembled_target_left
-                    + (1.0 - action_filter_alpha) * filtered_policy_left
-                )
-                filtered_policy_right = (
-                    action_filter_alpha * ensembled_target_right
-                    + (1.0 - action_filter_alpha) * filtered_policy_right
-                )
-                filtered_target_left = filtered_policy_left.copy()
-                filtered_target_right = filtered_policy_right.copy()
-                small_left = np.abs(filtered_target_left - command_left) < action_deadband_left
-                small_right = np.abs(filtered_target_right - command_right) < action_deadband_right
-                filtered_target_left[small_left] = command_left[small_left]
-                filtered_target_right[small_right] = command_right[small_right]
-            else:
-                filtered_target_left = ensembled_target_left
-                filtered_target_right = ensembled_target_right
-            if delta_clip_enabled:
-                target_left = clip_joint_delta(clip_reference_left, filtered_target_left, delta_clip_left)
-                target_right = clip_joint_delta(clip_reference_right, filtered_target_right, delta_clip_right)
-            else:
-                target_left = filtered_target_left
-                target_right = filtered_target_right
+
+        if action_filter_enabled:
+            if filtered_policy_left is None or filtered_policy_right is None:
+                filtered_policy_left = command_left.copy()
+                filtered_policy_right = command_right.copy()
+            filtered_policy_left = (
+                action_filter_alpha * ensembled_target_left
+                + (1.0 - action_filter_alpha) * filtered_policy_left
+            )
+            filtered_policy_right = (
+                action_filter_alpha * ensembled_target_right
+                + (1.0 - action_filter_alpha) * filtered_policy_right
+            )
+            filtered_target_left = filtered_policy_left.copy()
+            filtered_target_right = filtered_policy_right.copy()
+            small_left = np.abs(filtered_target_left - command_left) < action_deadband_left
+            small_right = np.abs(filtered_target_right - command_right) < action_deadband_right
+            filtered_target_left[small_left] = command_left[small_left]
+            filtered_target_right[small_right] = command_right[small_right]
+        else:
+            filtered_target_left = ensembled_target_left
+            filtered_target_right = ensembled_target_right
+        if delta_clip_enabled:
+            target_left = clip_joint_delta(clip_reference_left, filtered_target_left, delta_clip_left)
+            target_right = clip_joint_delta(clip_reference_right, filtered_target_right, delta_clip_right)
+        else:
+            target_left = filtered_target_left
+            target_right = filtered_target_right
 
         clipped_target_left = target_left.copy()
         clipped_target_right = target_right.copy()
@@ -3237,13 +1923,7 @@ def main():
                         if gripper_candidate is not None:
                             # The guard holds the previously sent gripper too;
                             # do not commit a transition that was not published.
-                            fraction = ((target[-1] - gripper_candidate.closed[arm_index]) /
-                                        (gripper_candidate.opened[arm_index] - gripper_candidate.closed[arm_index]))
-                            gripper_candidate.is_open[arm_index] = fraction >= 0.5
-                            gripper_candidate.count[arm_index] = 0
-                            gripper_transition['output_open'][arm_index] = bool(fraction >= 0.5)
-                            gripper_transition['switched'][arm_index] = False
-                            gripper_transition['pending_count'][arm_index] = 0
+                            gripper_candidate.hold(arm_index, target[-1], gripper_transition)
                 publish_joint_pair(pub_l, pub_r, name_list, ik_joint_left, ik_joint_right)
                 last_ik_publish_time = time.monotonic()
                 eef_ik.commit('left', ik_left_result)
@@ -3256,13 +1936,7 @@ def main():
                     )
                     published_first_command = True
             else:
-                js = JointState()
-                js.header.stamp = rospy.Time.now()
-                js.name = name_list
-                js.position = target_left.tolist()
-                pub_l.publish(js)
-                js.position = target_right.tolist()
-                pub_r.publish(js)
+                publish_joint_pair(pub_l, pub_r, name_list, target_left, target_right)
                 if not published_first_command:
                     rospy.loginfo(
                         f"Published first command to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
@@ -3441,13 +2115,7 @@ def main():
             if not has_obs and not has_live_chunk and pending_request is None:
                 now = time.monotonic()
                 if now - last_obs_wait_warn >= 2.0:
-                    with lock:
-                        missing = [
-                            key for key in (('front', 'left', 'right', 'jl', 'jr') + (('eef_l', 'eef_r') if eef_action_mode else ()))
-                            if buf[key] is None
-                        ]
-                        if use_base and buf['odom'] is None:
-                            missing.append('odom')
+                    missing = missing_obs_keys(use_base=use_base, require_eef=eef_action_mode)
                     rospy.logwarn(f"Waiting for observations: missing={missing}")
                     last_obs_wait_warn = now
                 rate.sleep()
@@ -3510,7 +2178,7 @@ def main():
                             )
                             last_stale_obs_warn = now
                     else:
-                        camera_seq = tuple(pkt['obs_seq'][key] for key in ('front', 'left', 'right'))
+                        camera_seq = tuple(pkt['obs_seq'][key] for key in CAMERA_KEYS)
                         if last_request_camera_seq is None:
                             fresh_flags = (True, True, True)
                         else:

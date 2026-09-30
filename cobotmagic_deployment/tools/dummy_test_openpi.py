@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-OpenPI side action server (Python 3.11+).
-- Receives observations from ROS bridge via ZeroMQ (REP)
-- Uses lightweight multipart messages (header + binary payloads)
-- Runs the Pi0 policy and returns actions in binary form
-- Settings loaded from a backend-specific YAML config
-"""
+"""Run one dummy OpenPI inference from a YAML config without ROS or ZeroMQ."""
 
 # === must be at the very top ===
 import os
@@ -17,32 +11,19 @@ os.environ.setdefault("MKL_SERVICE_FORCE_INTEL", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("ARROW_NUM_THREADS", "1")
 
-# 「深い階層で import される前に」安定状態で先に読み込む
-
 
 import argparse
-import cv2
+
 import numpy as np
 import torch
 import yaml
 
-from cobotmagic_deployment.policies.policy_openpi import Pi0Policy
-
-
-def decode_jpeg(buf: bytes):
-    arr = np.frombuffer(buf, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Failed to decode JPEG image.")
-    return img
-
-
-def preprocess_rgb(img_bgr, out_hw=(256, 256)):
-    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_AREA)
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    return img
+from cobotmagic_deployment.policies.policy_openpi import (
+    DEFAULT_CHECKPOINT_DIR,
+    DEFAULT_POLICY_CONFIG_NAME,
+    Pi0Policy,
+    preprocess_image,
+)
 
 
 def main():
@@ -54,11 +35,8 @@ def main():
         cfg = yaml.safe_load(f)
 
     openpi_cfg = cfg.get("openpi", {})
-    policy_config_name = openpi_cfg.get("policy_config_name", "pi0_mobile_aloha_lora_local")
-    checkpoint_dir = openpi_cfg.get(
-        "checkpoint_dir",
-        "/workspace/project/openpi/checkpoints/pi0_mobile_aloha_lora_local/mobile_aloha_lora/10000",
-    )
+    policy_config_name = openpi_cfg.get("policy_config_name", DEFAULT_POLICY_CONFIG_NAME)
+    checkpoint_dir = openpi_cfg.get("checkpoint_dir", DEFAULT_CHECKPOINT_DIR)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[openpi] running on {device}")
@@ -77,9 +55,9 @@ def main():
     jleft = np.array([0.0, -0.5, 0.5, 0.0, 0.2, -0.2, 0.8], dtype=np.float32)
     jright = np.array([0.0, 0.5, -0.5, 0.0, -0.2, 0.2, 0.8], dtype=np.float32)
 
-    f_t = torch.from_numpy(preprocess_rgb(imgs["front"], (rgb_h, rgb_w))).float()
-    l_t = torch.from_numpy(preprocess_rgb(imgs["left"], (rgb_h, rgb_w))).float()
-    r_t = torch.from_numpy(preprocess_rgb(imgs["right"], (rgb_h, rgb_w))).float()
+    f_t = torch.from_numpy(preprocess_image(imgs["front"], (rgb_h, rgb_w))).float()
+    l_t = torch.from_numpy(preprocess_image(imgs["left"], (rgb_h, rgb_w))).float()
+    r_t = torch.from_numpy(preprocess_image(imgs["right"], (rgb_h, rgb_w))).float()
     qpos = torch.from_numpy(np.concatenate([jleft, jright], axis=0)).float()
 
     action_chunk = policy(f_t, l_t, r_t, qpos, task_prompt)

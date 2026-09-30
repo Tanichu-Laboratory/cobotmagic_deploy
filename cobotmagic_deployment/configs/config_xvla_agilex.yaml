@@ -15,10 +15,8 @@ xvla:
   torch_dtype: "bfloat16"
   warmup: true
   warmup_image_hw: [480, 640]
-  # Bridge sends current EEF pose from /puppet/end_pose_* as X-VLA 20D EE6D proprio.
-  proprio_mode: "bridge_eef_pose"
-  # Convert model EE6D actions into EEF chunks: xyz + euler_xyz + gripper.
-  action_output: "ee6d_to_xyz_euler_gripper"
+  # The bridge sends the /puppet/end_pose_* pose as 20D EE6D proprio
+  # (xvla_proprio); the server converts EE6D actions to xyz + euler + gripper.
 
 task_prompt: "flatten the cloth and then fold it, then place it to the right side of you"
 
@@ -121,8 +119,6 @@ ros:
     cmd_joint_right: "/master/joint_right"
     puppet_arm_left_pose: "/puppet/end_pose_left"
     puppet_arm_right_pose: "/puppet/end_pose_right"
-    control_arm_left_pose: "/control/end_pose_left"
-    control_arm_right_pose: "/control/end_pose_right"
     enable_flag: "/enable_flag"
   publish_enable_flag: true
   use_robot_base: false

@@ -93,13 +93,16 @@ def test_observation(cfg):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="cobotmagic_deployment/configs/config_openwam_piper.yaml")
-    parser.add_argument("--mock", action="store_true")
+    parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_openwam_piper.yaml")
+    parser.add_argument("--bind", default="", help="Override zmq.server_bind from config YAML")
+    parser.add_argument("--mock", action="store_true", help="serve current EEF state as actions without loading weights")
     parser.add_argument("--startup-test", action="store_true", help="infer once without ROS or a listening socket, then exit")
-    parser.add_argument("--denoise-steps", type=int)
+    parser.add_argument("--denoise-steps", type=int, help="Override openwam.denoise_steps")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = yaml.safe_load(Path(args.config).read_text())
+    if args.bind:
+        cfg["zmq"]["server_bind"] = args.bind
     if args.denoise_steps is not None:
         cfg["openwam"]["denoise_steps"] = args.denoise_steps
     # Reserve the endpoint before loading 25GB of weights. Keeping the bound

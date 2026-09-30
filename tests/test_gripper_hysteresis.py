@@ -91,3 +91,15 @@ def test_relative_requires_request_reference():
     c=GripperHysteresis(REL)
     with pytest.raises(ValueError,match='request_opening'):
         c.propose([0,0],[0,0])
+
+
+def test_hold_resyncs_state_to_published_value():
+    h = GripperHysteresis(CFG)
+    _, candidate, diag = h.propose([0.0, 0.0], [0.07, 0.07])
+    _, candidate, diag = candidate.propose([0.0, 0.0], [0.07, 0.07])
+    assert diag['switched'] == [True, True]
+    candidate.hold(0, 0.07, diag)
+    assert candidate.is_open.tolist() == [True, False]
+    assert diag['output_open'] == [True, False]
+    assert diag['switched'] == [False, True]
+    assert candidate.count.tolist() == [0, 0]
