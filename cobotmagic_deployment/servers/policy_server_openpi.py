@@ -25,7 +25,8 @@ import numpy as np
 import torch
 import yaml
 
-from cobotmagic_deployment.common.policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
+from cobotmagic_deployment.common.policy_server_protocol import bind_server
+from cobotmagic_deployment.common.policy_server_runtime import serve
 from cobotmagic_deployment.policies.policy_openpi import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_POLICY_CONFIG_NAME,
@@ -39,6 +40,40 @@ def clip_base(vw, v_max=0.2, w_max=0.6):
     clipped[:, 0] = np.clip(vw[:, 0], -v_max, v_max)
     clipped[:, 1] = np.clip(vw[:, 1], -w_max, w_max)
     return clipped
+
+
+class OpenPIBackend:
+    """Adapt ``Pi0Policy`` to the policy-server runtime (``predict(header, images)``)."""
+
+    action_mode = None
+
+    def __init__(self, policy, cfg):
+        self.policy = policy
+        self.rgb_hw = tuple(cfg.get("openpi", {}).get("rgb_hw", [256, 256]))
+        self.use_base = bool(cfg["ros"].get("use_robot_base", False))
+        clip_cfg = cfg["ros"].get("clip", {"v_max": 0.2, "w_max": 0.6})
+        self.v_max = float(clip_cfg.get("v_max", 0.2))
+        self.w_max = float(clip_cfg.get("w_max", 0.6))
+
+    def predict(self, header, imgs):
+        f_t, l_t, r_t = (
+            torch.from_numpy(preprocess_image(imgs[key], self.rgb_hw)).float()
+            for key in ("front", "left", "right")
+        )
+        jleft = np.asarray(header["jleft"], dtype=np.float32)
+        jright = np.asarray(header["jright"], dtype=np.float32)
+        qpos = torch.from_numpy(np.concatenate([jleft, jright], axis=0)).float()
+
+        action_chunk = self.policy(f_t, l_t, r_t, qpos, header.get("task_prompt", "demo-task"))
+        if isinstance(action_chunk, torch.Tensor):
+            action_chunk = action_chunk.detach().cpu().numpy()
+        action_chunk = np.asarray(action_chunk, dtype=np.float32)
+        if action_chunk.ndim != 2 or action_chunk.shape[0] == 0:
+            raise ValueError(f"unexpected action shape {action_chunk.shape}")
+        vel = None
+        if self.use_base and action_chunk.shape[1] >= 16:
+            vel = clip_base(action_chunk[:, 14:16], v_max=self.v_max, w_max=self.w_max)
+        return action_chunk[:, :14], vel
 
 
 def main():
@@ -68,52 +103,10 @@ def main():
     print("[openpi] model loaded")
     torch.set_grad_enabled(False)
 
-    rgb_hw = tuple(openpi_cfg.get("rgb_hw", [256, 256]))
-    use_base = bool(cfg["ros"].get("use_robot_base", False))
-    clip_cfg = cfg["ros"].get("clip", {"v_max": 0.2, "w_max": 0.6})
-    v_max = float(clip_cfg.get("v_max", 0.2))
-    w_max = float(clip_cfg.get("w_max", 0.6))
-
-    while True:
-        try:
-            header, imgs = recv_packet(sock)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[openpi] recv error: {exc}")
-            send_empty(sock, str(exc), action_mode=None)
-            continue
-
-        f_t, l_t, r_t = (
-            torch.from_numpy(preprocess_image(imgs[key], rgb_hw)).float()
-            for key in ("front", "left", "right")
-        )
-        jleft = np.asarray(header["jleft"], dtype=np.float32)
-        jright = np.asarray(header["jright"], dtype=np.float32)
-        qpos = torch.from_numpy(np.concatenate([jleft, jright], axis=0)).float()
-
-        action_chunk = policy(f_t, l_t, r_t, qpos, header.get("task_prompt", "demo-task"))
-        if isinstance(action_chunk, torch.Tensor):
-            action_chunk_np = action_chunk.detach().cpu().numpy()
-        else:
-            action_chunk_np = np.asarray(action_chunk, dtype=np.float32)
-
-        if action_chunk_np.ndim != 2 or action_chunk_np.shape[0] == 0:
-            print("[openpi] unexpected action shape, reply empty")
-            send_empty(sock, f"unexpected action shape {action_chunk_np.shape}", action_mode=None)
-            continue
-
-        vel = None
-        if use_base and action_chunk_np.shape[1] >= 16:
-            vel = clip_base(action_chunk_np[:, 14:16], v_max=v_max, w_max=w_max)
-
-        # The bridge interprets OpenPI actions using ros.action_mode, so the
-        # response does not declare its own action_mode.
-        send_actions(
-            sock,
-            action_chunk_np[:, :14],
-            control_hz=float(header.get("control_hz", cfg["ros"].get("rate_hz", 20))),
-            action_mode=None,
-            vel=vel,
-        )
+    backend = OpenPIBackend(policy, cfg)
+    # The bridge interprets OpenPI actions using ros.action_mode, so replies
+    # do not declare an action_mode.
+    serve(backend, sock, name="openpi", action_mode=None, verbose=False)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,88 @@
+# Template for a new policy model (see servers/policy_server_template.py).
+# The bridge features below are switched on per model with `enabled: true`;
+# README "付録B" lists every option.
+policy_backend: "template"
+
+template:
+  chunk_size: 16
+  warmup: false
+  warmup_image_hw: [480, 640]
+
+task_prompt: "demo-task"
+
+ros:
+  image_type: "raw"
+  jpeg_quality: 80
+  rate_hz: 5
+  policy_response_timeout_sec: 5.0
+  max_joint_age_sec: 0.75
+  max_image_age_sec: 2.0
+  # absolute: joint targets / eef_absolute: EEF poses + bridge IK (eef_ik) / velocity
+  action_mode: "absolute"
+  open_loop_steps: 8
+  policy_request:
+    when_live_chunk: "wait"      # "allow": request while the current chunk still runs
+  policy_gripper_input:
+    mode: "measured"             # measured / commanded / hybrid
+
+  # --- chunk processing on receipt (common/chunk_pipeline.py) ---
+  action_chunk_lowpass:
+    enabled: false
+    cutoff_hz: 1.2
+  action_chunk_monotonic:
+    enabled: false
+  chunk_interpolation:
+    enabled: false
+    mode: "adaptive_delta"       # or "linear" with factor
+    initial_bridge_enabled: false
+
+  # --- asynchronous execution (common/chunk_scheduler.py) ---
+  temporal_ensemble:
+    enabled: false
+    latency_compensation:
+      enabled: false
+
+  # --- per-step shaping (common/command_shaper.py) ---
+  action_filter:
+    enabled: false
+  delta_clip:
+    enabled: false
+    reference: "current"
+    max_delta: [0.006, 0.012, 0.012, 0.010, 0.010, 0.010, 1000.0]
+  gripper_threshold:
+    enabled: false
+  gripper_hysteresis:
+    enabled: false
+
+  # --- output (common/command_publisher.py, common/ik_commander.py) ---
+  command_publish:
+    mode: "direct"               # "interpolated" publishes at command_publish.rate_hz
+  eef_ik:
+    enabled: false               # required for action_mode: eef_absolute
+
+  action_log:
+    enabled: true
+    dir: "logs/action_commands"
+  topics:
+    img_front: "/camera_f/color/image_raw"
+    img_left: "/camera_l/color/image_raw"
+    img_right: "/camera_r/color/image_raw"
+    puppet_arm_left: "/puppet/joint_left"
+    puppet_arm_right: "/puppet/joint_right"
+    cmd_joint_left: "/master/joint_left"
+    cmd_joint_right: "/master/joint_right"
+    enable_flag: "/enable_flag"
+  publish_enable_flag: true
+  shutdown_safety:
+    enabled: true
+  home_position:
+    mode: "linear"
+    rate_hz: 200
+    num_steps: 200
+    left: [-0.0010295446263626218, 0.30587080121040344, -0.393717885017395, 0.005400840658694506, 0.5136011838912964, 0.08619414269924164, -0.003028000006452203]
+    right: [0.07645199447870255, 0.3571706712245941, -0.38943028450012207, -0.07059866189956665, 0.5584428906440735, 0.015449974685907364, -0.0025159993674606085]
+
+zmq:
+  socket_type: "req"
+  server_bind: "tcp://127.0.0.1:5561"
+  client_connect: "tcp://127.0.0.1:5561"

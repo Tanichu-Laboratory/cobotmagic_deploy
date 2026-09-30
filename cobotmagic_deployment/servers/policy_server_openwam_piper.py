@@ -12,12 +12,15 @@ import numpy as np
 import yaml
 
 from cobotmagic_deployment.common.openwam_piper import actions_to_bridge, request_state, validate_checkpoint, gripper_action_open_normalized
-from cobotmagic_deployment.common.policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
+from cobotmagic_deployment.common.policy_server_protocol import bind_server
+from cobotmagic_deployment.common.policy_server_runtime import serve
 
 LOG = logging.getLogger("openwam_piper")
 
 
 class OpenWAMPiperPolicy:
+    action_mode = "eef_absolute"
+
     def __init__(self, cfg, mock=False):
         self.cfg = cfg
         self.options = cfg["openwam"]
@@ -128,14 +131,9 @@ def main():
         if args.startup_test:
             return
         LOG.info("READY %s %s", kind, cfg["zmq"]["server_bind"])
-        while True:
-            try:
-                header, images = recv_packet(sock)
-                actions = policy.predict(header, images)
-                send_actions(sock, actions, float(cfg["ros"]["rate_hz"]), action_mode="eef_absolute")
-            except Exception as exc:
-                LOG.exception("request failed")
-                send_empty(sock, str(exc), action_mode="eef_absolute")
+        serve(policy, sock, name="openwam", action_mode=policy.action_mode,
+              control_hz=float(cfg["ros"]["rate_hz"]), verbose=False,
+              on_error=lambda exc: LOG.exception("request failed"))
     except KeyboardInterrupt:
         pass
     finally:

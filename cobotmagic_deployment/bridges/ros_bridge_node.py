@@ -6,6 +6,11 @@ ROS Noetic side bridge (Python 3.8).
 - Sends compact multipart messages to the policy server via ZeroMQ (REQ)
 - Receives actions (binary float32 arrays) and publishes to ROS
 - Designed for minimal overhead between separate conda environments
+
+The ROS-specific parts (topics, home motion, shutdown safety) live here; the
+asynchronous inference, chunk processing, command shaping and IK are
+ROS-independent modules under ``cobotmagic_deployment.common`` that
+``DualArmPolicyBridge`` wires together.
 """
 
 import argparse
@@ -15,27 +20,24 @@ import time
 
 import numpy as np
 import yaml
-import zmq
 from cobotmagic_deployment.bridges.action_logging import (
     make_action_logger, make_rollout_dataset_logger, norm_first_six,
     save_action_chunk, save_request_snapshot, save_rollout_action,
     save_rollout_observation, vector_to_json, write_action_log,
 )
 from cobotmagic_deployment.common.action_processing import (
-    adaptive_bridge_to_first_action, adaptive_delta_upsample_chunks,
-    apply_joint_delta_deadband, clip_joint_delta, eef_pose_and_gripper_to_command,
-    eef_pose_and_gripper_to_ee6d, exponential_temporal_ensemble,
-    filter_chunk_by_terminal_displacement, interpolate_arm_command_keep_gripper,
-    interpolate_with_segment_factors, linear_upsample_chunk,
-    lowpass_dual_action_chunks_zero_phase, override_arm_delta_from_initial_pose,
-    parse_arm_selection,
-    project_action_chunk_monotonic_to_endpoint, scale_action_delta_from_reference,
-    scale_gripper_deltas, smooth_dual_action_chunks_savgol, step_towards,
-    threshold_gripper_targets, validate_policy_action_mode,
+    eef_pose_and_gripper_to_command, eef_pose_and_gripper_to_ee6d, step_towards,
 )
-from cobotmagic_deployment.common.gripper_hysteresis import GripperHysteresis
-from cobotmagic_deployment.common.piper_ik import PiperNumericalIK
-from cobotmagic_deployment.common.policy_server_protocol import client_socket_kind, encode_jpeg
+from cobotmagic_deployment.common.bridge_log import BridgeLog
+from cobotmagic_deployment.common.chunk_pipeline import (
+    ChunkPipeline, ChunkRejected, InvalidPolicyResponse, parse_action_response,
+)
+from cobotmagic_deployment.common.chunk_scheduler import ChunkScheduler, PolicyRequestGate, stale_observations
+from cobotmagic_deployment.common.command_publisher import InterpolatedCommandPublisher, command_publish_settings
+from cobotmagic_deployment.common.command_shaper import CommandShaper, PolicyGripperInput, VelocityIntegrator
+from cobotmagic_deployment.common.ik_commander import EefIkCommander
+from cobotmagic_deployment.common.policy_client import AsyncPolicyClient
+from cobotmagic_deployment.common.policy_server_protocol import encode_jpeg
 
 import rospy
 from cv_bridge import CvBridge
@@ -61,7 +63,6 @@ buf_seq = {key: 0 for key in buf}
 buf_time = {key: None for key in buf}
 lock = threading.Lock()
 enable_state = True  # /enable_flag があればこれに従う
-published_first_command = False
 CAMERA_KEYS = ('front', 'left', 'right')
 
 
@@ -215,15 +216,6 @@ def wait_for_joint_arrays(timeout_sec=10.0):
             break
         rate.sleep()
     return None, None
-
-
-def make_policy_socket(ctx, connect_addr, timeout_ms, socket_type):
-    sock = ctx.socket(client_socket_kind(socket_type))
-    sock.connect(connect_addr)
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-    return sock
 
 
 def publish_joint_pair(pub_l, pub_r, name_list, left_pos, right_pos):
@@ -463,765 +455,215 @@ def run_shutdown_safety(pub_l, pub_r, pub_v, enable_pub, name_list, cfg):
             time.sleep(1.0 / rate_hz)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--config', required=True, help='path to a backend-specific YAML config')
-    args = ap.parse_args()
+class DualArmPolicyBridge:
+    """CobotMagic dual-arm bridge: ROS observations -> policy server -> ROS commands.
 
-    with open(args.config, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
+    The ROS-independent building blocks can be reused on their own:
 
-    rospy.init_node('cobotmagic_policy_bridge_node')
+    * :class:`~cobotmagic_deployment.common.policy_client.AsyncPolicyClient`: non-blocking requests
+    * :class:`~cobotmagic_deployment.common.chunk_scheduler.ChunkScheduler` / ``PolicyRequestGate``:
+      asynchronous chunk timeline, temporal ensemble, latency compensation, request timing
+    * :class:`~cobotmagic_deployment.common.chunk_pipeline.ChunkPipeline`: filters and interpolation on receipt
+    * :class:`~cobotmagic_deployment.common.command_shaper.CommandShaper`: per-step filters and gripper handling
+    * :class:`~cobotmagic_deployment.common.ik_commander.EefIkCommander`: EEF targets -> joint commands
+    * :class:`~cobotmagic_deployment.common.command_publisher.InterpolatedCommandPublisher`: high-rate publish
+    """
 
-    image_type = cfg['ros'].get('image_type', 'raw').lower()
-    jpeg_quality = int(cfg['ros'].get('jpeg_quality', 80))
-    rate_hz = int(cfg['ros'].get('rate_hz', 20))
-    rate_hz = max(rate_hz, 1)
-    action_mode = cfg['ros'].get('action_mode', 'velocity').lower()
-    if action_mode not in ('velocity', 'absolute', 'eef_absolute'):
-        raise ValueError(f"ros.action_mode must be 'velocity', 'absolute', or 'eef_absolute', got {action_mode!r}")
-    eef_action_mode = action_mode == 'eef_absolute'
-    command_publish_cfg = cfg['ros'].get('command_publish', {})
-    command_publish_mode = command_publish_cfg.get('mode', 'direct').lower()
-    if command_publish_mode not in ('direct', 'interpolated'):
-        rospy.logwarn(
-            f"Unsupported command_publish.mode={command_publish_mode!r}; using ACT-style 'direct'."
-        )
-        command_publish_mode = 'direct'
-    if eef_action_mode and command_publish_mode != 'direct':
-        rospy.logwarn("eef_absolute only supports command_publish.mode='direct'; using direct.")
-        command_publish_mode = 'direct'
-    if command_publish_mode == 'direct':
-        command_publish_rate_hz = float(rate_hz)
-        command_publish_substeps = 1
-    else:
-        command_publish_rate_hz = float(command_publish_cfg.get('rate_hz', rate_hz))
-        command_publish_rate_hz = max(command_publish_rate_hz, float(rate_hz))
-        command_publish_substeps = max(int(round(command_publish_rate_hz / float(rate_hz))), 1)
-        command_publish_rate_hz = float(command_publish_substeps * rate_hz)
-    command_publish_interpolation = command_publish_cfg.get('interpolation', 'linear').lower()
-    if command_publish_interpolation != 'linear':
-        rospy.logwarn(
-            f"Unsupported command_publish.interpolation={command_publish_interpolation!r}; using 'linear'."
-        )
-        command_publish_interpolation = 'linear'
-    command_publish_period_sec = 1.0 / command_publish_rate_hz
-    policy_response_timeout_sec = float(cfg['ros'].get('policy_response_timeout_sec', 5.0))
-    max_joint_age_sec = float(cfg['ros'].get('max_joint_age_sec', 0.75))
-    max_image_age_sec = float(cfg['ros'].get('max_image_age_sec', 2.0))
-    open_loop_steps_cfg = cfg['ros'].get('open_loop_steps')
-    open_loop_steps = None if open_loop_steps_cfg is None else max(int(open_loop_steps_cfg), 1)
-    policy_request_cfg = cfg['ros'].get('policy_request', {})
-    policy_request_when_live_chunk = str(policy_request_cfg.get('when_live_chunk', 'allow')).lower()
-    if policy_request_when_live_chunk not in ('allow', 'wait'):
-        rospy.logwarn(
-            "policy_request.when_live_chunk must be 'allow' or 'wait'; using 'allow'."
-        )
-        policy_request_when_live_chunk = 'allow'
-    interpolation_cfg = cfg['ros'].get('chunk_interpolation', {})
-    interpolation_enabled = bool(interpolation_cfg.get('enabled', False))
-    interpolation_mode = interpolation_cfg.get('mode', 'linear').lower()
-    interpolation_factor = float(interpolation_cfg.get('factor', 1.0))
-    interpolation_factor = max(interpolation_factor, 1.0)
-    adaptive_min_factor = max(int(interpolation_cfg.get('min_factor', 1)), 1)
-    adaptive_max_factor = max(int(interpolation_cfg.get('max_factor', max(1, int(round(interpolation_factor))))), 1)
-    adaptive_max_factor = max(adaptive_max_factor, adaptive_min_factor)
-    adaptive_source_steps_to_execute = interpolation_cfg.get('source_steps_to_execute')
-    if adaptive_source_steps_to_execute is not None:
-        adaptive_source_steps_to_execute = max(int(adaptive_source_steps_to_execute), 1)
-    adaptive_source_overlap_steps = interpolation_cfg.get('source_overlap_steps')
-    if adaptive_source_overlap_steps is not None:
-        adaptive_source_overlap_steps = max(int(adaptive_source_overlap_steps), 0)
-    adaptive_joint_threshold = interpolation_cfg.get('joint_threshold', [0.024, 0.069, 0.070, 0.039, 0.046, 0.046, 0.0034])
-    adaptive_bridge_enabled = bool(interpolation_cfg.get('initial_bridge_enabled', False))
-    adaptive_bridge_max_factor = max(int(interpolation_cfg.get('initial_bridge_max_factor', adaptive_max_factor)), 1)
-    adaptive_bridge_max_factor = max(adaptive_bridge_max_factor, adaptive_min_factor)
-    delta_clip_cfg = cfg['ros'].get('delta_clip')
-    delta_clip_enabled = bool(delta_clip_cfg and delta_clip_cfg.get('enabled', False))
-    command_delta_deadband_cfg = cfg['ros'].get('command_delta_deadband', {})
-    command_delta_deadband_enabled = bool(command_delta_deadband_cfg.get('enabled', False))
-    first_action_delta_scale_cfg = cfg['ros'].get('first_action_delta_scale', {})
-    first_action_delta_scale_enabled = bool(first_action_delta_scale_cfg.get('enabled', False))
-    first_action_delta_scale_raw = float(first_action_delta_scale_cfg.get('coefficient', 1.0))
-    first_action_delta_scale_coefficient = float(np.clip(first_action_delta_scale_raw, 0.0, 1.0))
-    if first_action_delta_scale_coefficient != first_action_delta_scale_raw:
-        rospy.logwarn(
-            "first_action_delta_scale.coefficient must be in [0, 1]; "
-            f"clamped {first_action_delta_scale_raw} to {first_action_delta_scale_coefficient}."
-        )
-    first_action_delta_scale_include_gripper = bool(
-        first_action_delta_scale_cfg.get('include_gripper', False)
-    )
-    initial_pose_override_cfg = cfg['ros'].get('initial_pose_delta_override', {})
-    initial_pose_override_enabled = bool(initial_pose_override_cfg.get('enabled', False))
-    initial_pose_override_arms, invalid_override_arms = parse_arm_selection(
-        initial_pose_override_cfg.get('arms', [])
-    )
-    if invalid_override_arms:
-        rospy.logwarn(
-            "initial_pose_delta_override.arms contains unsupported values "
-            f"{sorted(invalid_override_arms)}; only left/right/both are accepted."
-        )
-    if initial_pose_override_enabled and not initial_pose_override_arms:
-        rospy.logwarn(
-            "initial_pose_delta_override is enabled but arms is empty; disabling the override."
-        )
-        initial_pose_override_enabled = False
-    initial_pose_override_left = initial_pose_override_enabled and 'left' in initial_pose_override_arms
-    initial_pose_override_right = initial_pose_override_enabled and 'right' in initial_pose_override_arms
-    initial_pose_override_include_gripper = bool(initial_pose_override_cfg.get('include_gripper', False))
-    terminal_filter_cfg = cfg['ros'].get('chunk_terminal_displacement_filter', {})
-    terminal_filter_enabled = bool(terminal_filter_cfg.get('enabled', False))
-    terminal_filter_left_threshold = np.asarray(
-        terminal_filter_cfg.get('left_threshold', [0.0] * 7), dtype=np.float32,
-    )
-    terminal_filter_right_threshold = np.asarray(
-        terminal_filter_cfg.get('right_threshold', [0.0] * 7), dtype=np.float32,
-    )
-    if terminal_filter_left_threshold.shape != (7,) or terminal_filter_right_threshold.shape != (7,):
-        rospy.logwarn(
-            "chunk_terminal_displacement_filter left_threshold/right_threshold must each contain 7 values; "
-            "disabling the filter."
-        )
-        terminal_filter_enabled = False
-    gripper_threshold_cfg = cfg['ros'].get('gripper_threshold', cfg['ros'].get('gripper_binary', {}))
-    gripper_threshold_enabled = bool(gripper_threshold_cfg.get('enabled', False))
-    gripper_delta_scale_cfg = cfg['ros'].get('gripper_delta_scale', {})
-    gripper_delta_scale_enabled = bool(gripper_delta_scale_cfg.get('enabled', False))
-    gripper_delta_gains = np.asarray([
-        max(float(gripper_delta_scale_cfg.get('left_gain', 1.0)), 0.0),
-        max(float(gripper_delta_scale_cfg.get('right_gain', 1.0)), 0.0),
-    ], dtype=np.float32)
-    gripper_delta_clip_min = gripper_delta_scale_cfg.get('clip_min')
-    gripper_delta_clip_max = gripper_delta_scale_cfg.get('clip_max')
-    if gripper_delta_clip_min is not None:
-        gripper_delta_clip_min = np.asarray(gripper_delta_clip_min, dtype=np.float32)
-    if gripper_delta_clip_max is not None:
-        gripper_delta_clip_max = np.asarray(gripper_delta_clip_max, dtype=np.float32)
-    if (
-        (gripper_delta_clip_min is not None and gripper_delta_clip_min.shape != (2,))
-        or (gripper_delta_clip_max is not None and gripper_delta_clip_max.shape != (2,))
-    ):
-        rospy.logwarn("gripper_delta_scale clip_min/clip_max must each contain [left, right]; disabling clipping.")
-        gripper_delta_clip_min = None
-        gripper_delta_clip_max = None
-    policy_gripper_input_cfg = cfg['ros'].get('policy_gripper_input', {})
-    policy_gripper_input_mode = str(policy_gripper_input_cfg.get('mode', 'measured')).lower()
-    if policy_gripper_input_mode not in ('measured', 'commanded', 'hybrid'):
-        rospy.logwarn(
-            "policy_gripper_input.mode must be one of measured/commanded/hybrid; "
-            f"got {policy_gripper_input_mode!r}. Using measured."
-        )
-        policy_gripper_input_mode = 'measured'
-    policy_gripper_input_hybrid_max_error = max(
-        float(policy_gripper_input_cfg.get('hybrid_max_error', 0.025)),
-        0.0,
-    )
-    action_filter_cfg = cfg['ros'].get('action_filter', {})
-    action_filter_enabled = bool(action_filter_cfg.get('enabled', False))
-    action_filter_alpha = float(action_filter_cfg.get('ema_alpha', 0.25))
-    action_filter_alpha = min(max(action_filter_alpha, 0.0), 1.0)
-    chunk_smoothing_cfg = cfg['ros'].get('action_chunk_smoothing', {})
-    chunk_smoothing_enabled = bool(chunk_smoothing_cfg.get('enabled', False))
-    chunk_smoothing_upsample = max(int(chunk_smoothing_cfg.get('upsample_factor', 2)), 1)
-    chunk_smoothing_window = max(int(chunk_smoothing_cfg.get('window_length', 21)), 3)
-    chunk_smoothing_polyorder = max(int(chunk_smoothing_cfg.get('polyorder', 3)), 0)
-    chunk_lowpass_cfg = cfg['ros'].get('action_chunk_lowpass', {})
-    chunk_lowpass_enabled = bool(chunk_lowpass_cfg.get('enabled', False))
-    chunk_lowpass_cutoff_hz = float(chunk_lowpass_cfg.get('cutoff_hz', 1.2))
-    chunk_lowpass_sample_rate_hz = float(
-        chunk_lowpass_cfg.get('sample_rate_hz', rate_hz)
-    )
-    chunk_lowpass_order = max(int(chunk_lowpass_cfg.get('order', 4)), 1)
-    chunk_lowpass_preserve_endpoints = bool(
-        chunk_lowpass_cfg.get('preserve_endpoints', True)
-    )
-    chunk_lowpass_include_gripper = bool(
-        chunk_lowpass_cfg.get('include_gripper', False)
-    )
-    if chunk_lowpass_enabled and not (
-        0.0 < chunk_lowpass_cutoff_hz < 0.5 * chunk_lowpass_sample_rate_hz
-    ):
-        raise ValueError(
-            "action_chunk_lowpass.cutoff_hz must be between 0 and "
-            f"{0.5 * chunk_lowpass_sample_rate_hz:.6g} Hz"
-        )
-    chunk_monotonic_cfg = cfg['ros'].get('action_chunk_monotonic', {})
-    chunk_monotonic_enabled = bool(chunk_monotonic_cfg.get('enabled', False))
-    chunk_monotonic_arms, invalid_monotonic_arms = parse_arm_selection(
-        chunk_monotonic_cfg.get('arms', ['left', 'right'])
-    )
-    if invalid_monotonic_arms:
-        raise ValueError(
-            "action_chunk_monotonic.arms only accepts left/right/both; got "
-            f"{sorted(invalid_monotonic_arms)}"
-        )
-    chunk_monotonic_strength = float(chunk_monotonic_cfg.get('strength', 1.0))
-    if not 0.0 <= chunk_monotonic_strength <= 1.0:
-        raise ValueError("action_chunk_monotonic.strength must be in [0, 1]")
-    chunk_monotonic_min_terminal_delta = max(
-        float(chunk_monotonic_cfg.get('min_terminal_delta', 1e-4)), 0.0
-    )
-    chunk_monotonic_include_gripper = bool(
-        chunk_monotonic_cfg.get('include_gripper', False)
-    )
-    temporal_ensemble_cfg = cfg['ros'].get('temporal_ensemble', {})
-    temporal_ensemble_enabled = bool(temporal_ensemble_cfg.get('enabled', False))
-    temporal_exp_decay = float(temporal_ensemble_cfg.get('exp_decay', 0.7))
-    temporal_exp_decay = max(temporal_exp_decay, 0.0)
-    temporal_max_history_chunks = max(int(temporal_ensemble_cfg.get('max_history_chunks', 4)), 1)
-    temporal_max_candidate_age = temporal_ensemble_cfg.get('max_candidate_age')
-    if temporal_max_candidate_age is not None:
-        temporal_max_candidate_age = max(int(temporal_max_candidate_age), 0)
-    temporal_min_action_index = max(int(temporal_ensemble_cfg.get('min_action_index', 0)), 0)
-    temporal_overlap_steps = temporal_ensemble_cfg.get('overlap_steps')
-    if temporal_overlap_steps is not None:
-        temporal_overlap_steps = max(int(temporal_overlap_steps), 0)
-    latency_comp_cfg = temporal_ensemble_cfg.get('latency_compensation', {})
-    latency_comp_enabled = bool(latency_comp_cfg.get('enabled', False))
-    latency_comp_mode = latency_comp_cfg.get('mode', 'measured').lower()
-    latency_fixed_steps = max(int(latency_comp_cfg.get('fixed_steps', 0)), 0)
-    latency_max_steps = latency_comp_cfg.get('max_steps')
-    if latency_max_steps is not None:
-        latency_max_steps = max(int(latency_max_steps), 0)
-    initial_action_skip_steps = max(int(cfg['ros'].get('initial_action_skip_steps', 0)), 0)
-    chunk_action_skip_steps = max(int(cfg['ros'].get('chunk_action_skip_steps', 0)), 0)
-    topics = cfg['ros']['topics']
-    task_prompt = cfg.get('task_prompt', 'demo-task')
+    def __init__(self, cfg, log=None):
+        self.cfg = cfg
+        self.log = log or BridgeLog.for_rospy()
+        ros_cfg = cfg['ros']
+        self.image_type = ros_cfg.get('image_type', 'raw').lower()
+        self.jpeg_quality = int(ros_cfg.get('jpeg_quality', 80))
+        self.rate_hz = max(int(ros_cfg.get('rate_hz', 20)), 1)
+        self.action_mode = ros_cfg.get('action_mode', 'velocity').lower()
+        if self.action_mode not in ('velocity', 'absolute', 'eef_absolute'):
+            raise ValueError(
+                f"ros.action_mode must be 'velocity', 'absolute', or 'eef_absolute', got {self.action_mode!r}")
+        self.eef_action_mode = self.action_mode == 'eef_absolute'
+        (self.command_publish_mode, self.command_publish_rate_hz,
+         self.command_publish_substeps, self.command_publish_interpolation) = command_publish_settings(
+            ros_cfg, self.rate_hz, self.eef_action_mode, self.log)
+        self.max_joint_age_sec = float(ros_cfg.get('max_joint_age_sec', 0.75))
+        self.max_image_age_sec = float(ros_cfg.get('max_image_age_sec', 2.0))
+        self.task_prompt = cfg.get('task_prompt', 'demo-task')
+        self.topics = ros_cfg['topics']
+        self.name_list = ros_cfg.get('joint_names', [f'joint{i}' for i in range(7)])
+        self.use_base = bool(ros_cfg.get('use_robot_base', False))
+        clip = ros_cfg.get('clip', {'v_max': 0.2, 'w_max': 0.6})
+        self.v_max = float(clip.get('v_max', 0.2))
+        self.w_max = float(clip.get('w_max', 0.6))
 
-    use_base = bool(cfg['ros'].get('use_robot_base', False))
-    clip = cfg['ros'].get('clip', {'v_max': 0.2, 'w_max': 0.6})
-    v_max = float(clip.get('v_max', 0.2))
-    w_max = float(clip.get('w_max', 0.6))
-    rb_topics = cfg['ros'].get('robot_base_topics', {'odom': '/odom', 'cmd_vel': '/cmd_vel'})
+        self.scheduler = ChunkScheduler(ros_cfg, self.rate_hz, self.log)
+        self.request_gate = PolicyRequestGate(ros_cfg, self.scheduler.latency_fixed_steps, self.log)
+        self.pipeline = ChunkPipeline(ros_cfg, self.rate_hz, self.scheduler.overlap_steps, self.log)
+        self.shaper = CommandShaper(ros_cfg, len(self.name_list), self.command_publish_mode, self.log)
+        self.gripper_input = PolicyGripperInput(ros_cfg, self.log)
+        self.integrator = VelocityIntegrator(1.0 / self.rate_hz / 4.0)
 
-    # Subscribers (images)
-    if image_type == 'compressed':
-        rospy.Subscriber(topics['img_front'] + '/compressed', CompressedImage, img_cb('front', 'compressed'), queue_size=10)
-        rospy.Subscriber(topics['img_left'] + '/compressed', CompressedImage, img_cb('left', 'compressed'), queue_size=10)
-        rospy.Subscriber(topics['img_right'] + '/compressed', CompressedImage, img_cb('right', 'compressed'), queue_size=10)
-    else:
-        rospy.Subscriber(topics['img_front'], Image, img_cb('front', 'raw', jpeg_quality), queue_size=10)
-        rospy.Subscriber(topics['img_left'], Image, img_cb('left', 'raw', jpeg_quality), queue_size=10)
-        rospy.Subscriber(topics['img_right'], Image, img_cb('right', 'raw', jpeg_quality), queue_size=10)
+        self.command_left = None
+        self.command_right = None
+        self.published_first_command = False
+        self.last_obs_wait_warn = 0.0
+        self.last_stale_obs_warn = 0.0
+        self.last_stale_joint_warn = 0.0
+        self.ik = None
+        self.publisher = None
+        self.client = None
+        self.action_logger = None
+        self.action_log_path = None
+        self.rollout_logger = None
 
-    # Subscribers (joints/base/enable)
-    rospy.Subscriber(topics['puppet_arm_left'], JointState, jl_cb, queue_size=50)
-    rospy.Subscriber(topics['puppet_arm_right'], JointState, jr_cb, queue_size=50)
-    if eef_action_mode:
-        rospy.Subscriber(topics.get('puppet_arm_left_pose', '/puppet/end_pose_left'), PoseStamped, eef_left_cb, queue_size=50)
-        rospy.Subscriber(topics.get('puppet_arm_right_pose', '/puppet/end_pose_right'), PoseStamped, eef_right_cb, queue_size=50)
-    if use_base and 'robot_base_topics' in cfg['ros']:
-        rospy.Subscriber(rb_topics['odom'], Odometry, odom_cb, queue_size=50)
+    # --- ROS setup --------------------------------------------------------
 
-    if 'enable_flag' in topics and topics['enable_flag']:
-        try:
-            rospy.Subscriber(topics['enable_flag'], Bool, enable_cb, queue_size=10)
-        except Exception:
-            pass
-
-    # Publishers
-    pub_l = rospy.Publisher(topics['cmd_joint_left'], JointState, queue_size=10)
-    pub_r = rospy.Publisher(topics['cmd_joint_right'], JointState, queue_size=10)
-    if eef_action_mode:
-        rospy.loginfo(
-            "EEF action mode enabled with bridge-side IK; "
-            f"publishing joint commands to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
-        )
-    enable_pub = None
-    if topics.get('enable_flag') and bool(cfg['ros'].get('publish_enable_flag', False)):
-        enable_pub = rospy.Publisher(topics['enable_flag'], Bool, queue_size=1, latch=True)
-        rospy.sleep(0.2)
-        enable_pub.publish(Bool(data=True))
-        rospy.loginfo(f"Published enable flag True on {topics['enable_flag']}.")
-    pub_v = None
-    if use_base:
-        pub_v = rospy.Publisher(rb_topics['cmd_vel'], Twist, queue_size=10)
-    rospy.loginfo(
-        "Command publish configured: "
-        f"mode={command_publish_mode} policy_rate={rate_hz}Hz "
-        f"publish_rate={command_publish_rate_hz:.1f}Hz "
-        f"substeps_per_action={command_publish_substeps} "
-        f"interpolation={command_publish_interpolation}"
-    )
-
-    # Home positioning before policy loop
-    name_list = cfg['ros'].get('joint_names', [f'joint{i}' for i in range(7)])
-    eef_ik = None
-    last_published_ik = {}
-    last_ik_publish_time = None
-    if eef_action_mode:
-        eef_ik_cfg = cfg['ros'].get('eef_ik', {})
-        if not bool(eef_ik_cfg.get('enabled', True)):
-            raise ValueError("ros.action_mode='eef_absolute' now requires ros.eef_ik.enabled=true")
-        eef_ik = PiperNumericalIK(eef_ik_cfg, loginfo=rospy.loginfo)
-        if eef_ik.differential is not None:
-            if abs(eef_ik.differential.period - 1.0 / rate_hz) > 1e-6:
-                raise ValueError("differential.control_period_sec must equal 1 / ros.rate_hz")
-            rospy.loginfo(
-                "Differential IK: bounded incremental tracking; pose residuals indicate "
-                "target accuracy, not automatic rejection; "
-                f"vmax={eef_ik.differential.vmax.tolist()} rad/s "
-                f"amax={eef_ik.differential.amax.tolist()} rad/s^2")
-        rospy.loginfo(
-            "EEF IK configured: "
-            f"solver={eef_ik.solver} urdf={eef_ik.urdf_path} base={eef_ik.base_link} tip={eef_ik.tip_link} "
-            f"max_pos_err={eef_ik.max_position_error_m:.4f}m "
-            f"max_rot_err={eef_ik.max_orientation_error_rad:.4f}rad"
-        )
-    home_cfg = cfg['ros'].get('home_position')
-    step_lengths = cfg['ros'].get('arm_steps_length', [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.2])
-    command_publish_lock = threading.Lock()
-    command_publish_state = {
-        'start_time': None,
-        'duration': 1.0 / float(rate_hz),
-        'start_left': None,
-        'start_right': None,
-        'target_left': None,
-        'target_right': None,
-    }
-
-    def command_publish_worker():
-        global published_first_command
-
-        next_publish_time = time.monotonic()
-        last_report_time = next_publish_time
-        report_count = 0
-        active_report_count = 0
-        while not rospy.is_shutdown():
-            with command_publish_lock:
-                start_time = command_publish_state['start_time']
-                start_left = None if command_publish_state['start_left'] is None else command_publish_state['start_left'].copy()
-                start_right = None if command_publish_state['start_right'] is None else command_publish_state['start_right'].copy()
-                target_left = None if command_publish_state['target_left'] is None else command_publish_state['target_left'].copy()
-                target_right = None if command_publish_state['target_right'] is None else command_publish_state['target_right'].copy()
-                duration = float(command_publish_state['duration'])
-
-            if start_time is not None and start_left is not None and target_left is not None:
-                elapsed = time.monotonic() - start_time
-                alpha = 1.0 if duration <= 0.0 else min(max(elapsed / duration, 0.0), 1.0)
-                publish_left = interpolate_arm_command_keep_gripper(
-                    start_left, target_left, alpha
-                )
-                publish_right = interpolate_arm_command_keep_gripper(
-                    start_right, target_right, alpha
-                )
-
-                publish_joint_pair(pub_l, pub_r, name_list, publish_left, publish_right)
-                if not published_first_command:
-                    rospy.loginfo(
-                        f"Published first command to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
-                    )
-                    published_first_command = True
-                active_report_count += 1
-            report_count += 1
-
-            now_report = time.monotonic()
-            if now_report - last_report_time >= 2.0:
-                elapsed_report = now_report - last_report_time
-                rospy.loginfo(
-                    "Command publish worker rate: "
-                    f"loop_hz={report_count / elapsed_report:.1f} "
-                    f"active_publish_hz={active_report_count / elapsed_report:.1f} "
-                    f"target_hz={command_publish_rate_hz:.1f}"
-                )
-                last_report_time = now_report
-                report_count = 0
-                active_report_count = 0
-
-            next_publish_time += command_publish_period_sec
-            sleep_sec = next_publish_time - time.monotonic()
-            if sleep_sec > 0.0:
-                time.sleep(sleep_sec)
+    def setup_ros(self):
+        topics = self.topics
+        ros_cfg = self.cfg['ros']
+        rb_topics = ros_cfg.get('robot_base_topics', {'odom': '/odom', 'cmd_vel': '/cmd_vel'})
+        for key, topic_key in (('front', 'img_front'), ('left', 'img_left'), ('right', 'img_right')):
+            if self.image_type == 'compressed':
+                rospy.Subscriber(topics[topic_key] + '/compressed', CompressedImage,
+                                 img_cb(key, 'compressed'), queue_size=10)
             else:
-                next_publish_time = time.monotonic()
+                rospy.Subscriber(topics[topic_key], Image, img_cb(key, 'raw', self.jpeg_quality), queue_size=10)
+        rospy.Subscriber(topics['puppet_arm_left'], JointState, jl_cb, queue_size=50)
+        rospy.Subscriber(topics['puppet_arm_right'], JointState, jr_cb, queue_size=50)
+        if self.eef_action_mode:
+            rospy.Subscriber(topics.get('puppet_arm_left_pose', '/puppet/end_pose_left'),
+                             PoseStamped, eef_left_cb, queue_size=50)
+            rospy.Subscriber(topics.get('puppet_arm_right_pose', '/puppet/end_pose_right'),
+                             PoseStamped, eef_right_cb, queue_size=50)
+        if self.use_base and 'robot_base_topics' in ros_cfg:
+            rospy.Subscriber(rb_topics['odom'], Odometry, odom_cb, queue_size=50)
+        if topics.get('enable_flag'):
+            try:
+                rospy.Subscriber(topics['enable_flag'], Bool, enable_cb, queue_size=10)
+            except Exception:
+                pass
 
-    if command_publish_mode == 'interpolated':
-        command_publish_thread = threading.Thread(
-            target=command_publish_worker,
-            name='command_publish_worker',
-            daemon=True,
+        self.pub_l = rospy.Publisher(topics['cmd_joint_left'], JointState, queue_size=10)
+        self.pub_r = rospy.Publisher(topics['cmd_joint_right'], JointState, queue_size=10)
+        if self.eef_action_mode:
+            self.log.info(
+                "EEF action mode enabled with bridge-side IK; "
+                f"publishing joint commands to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
+            )
+        self.enable_pub = None
+        if topics.get('enable_flag') and bool(ros_cfg.get('publish_enable_flag', False)):
+            self.enable_pub = rospy.Publisher(topics['enable_flag'], Bool, queue_size=1, latch=True)
+            rospy.sleep(0.2)
+            self.enable_pub.publish(Bool(data=True))
+            self.log.info(f"Published enable flag True on {topics['enable_flag']}.")
+        self.pub_v = rospy.Publisher(rb_topics['cmd_vel'], Twist, queue_size=10) if self.use_base else None
+        self.log.info(
+            "Command publish configured: "
+            f"mode={self.command_publish_mode} policy_rate={self.rate_hz}Hz "
+            f"publish_rate={self.command_publish_rate_hz:.1f}Hz "
+            f"substeps_per_action={self.command_publish_substeps} "
+            f"interpolation={self.command_publish_interpolation}"
         )
-        command_publish_thread.start()
 
-    delta_clip_left = None
-    delta_clip_right = None
-    command_delta_deadband_left = None
-    command_delta_deadband_right = None
-    action_deadband_left = None
-    action_deadband_right = None
-    if delta_clip_enabled:
-        delta_clip_reference = delta_clip_cfg.get('reference', 'command').lower()
-        if delta_clip_reference not in ('command', 'current'):
-            rospy.logwarn(
-                f"Unsupported delta_clip.reference={delta_clip_reference!r}; "
-                "using 'command'."
+        if self.eef_action_mode:
+            self.ik = EefIkCommander(ros_cfg.get('eef_ik', {}), self.rate_hz, self.log)
+            self.ik.log_configuration()
+        if self.command_publish_mode == 'interpolated':
+            self.publisher = InterpolatedCommandPublisher(
+                lambda left, right: publish_joint_pair(self.pub_l, self.pub_r, self.name_list, left, right),
+                self.command_publish_rate_hz,
+                1.0 / float(self.rate_hz),
+                rospy.is_shutdown,
+                on_publish=self._note_published,
+                log=self.log,
+            ).start()
+        self.shaper.log_configuration()
+        self.pipeline.log_configuration()
+        self.scheduler.log_configuration()
+
+    def _note_published(self, ik=False):
+        if not self.published_first_command:
+            kind = 'IK joint command' if ik else 'command'
+            self.log.info(
+                f"Published first {kind} to {self.topics['cmd_joint_left']} and {self.topics['cmd_joint_right']}."
             )
-            delta_clip_reference = 'command'
-        max_delta = delta_clip_cfg.get('max_delta', step_lengths)
-        max_delta = np.asarray(max_delta, dtype=np.float32)
-        if max_delta.shape[0] != len(name_list):
-            rospy.logwarn("delta_clip.max_delta size mismatch; using arm_steps_length.")
-            max_delta = np.asarray(step_lengths, dtype=np.float32)
-        if max_delta.shape[0] != len(name_list):
-            rospy.logwarn("delta clip disabled: max_delta and arm_steps_length sizes do not match joint_names.")
-            delta_clip_enabled = False
-        else:
-            delta_clip_left = max_delta
-            delta_clip_right = max_delta
-            rospy.loginfo(
-                f"Joint delta clip enabled: max_delta={max_delta.tolist()} "
-                f"reference={delta_clip_reference}"
-            )
-    else:
-        delta_clip_reference = 'command'
-    if command_delta_deadband_enabled:
-        deadband_left = np.asarray(
-            command_delta_deadband_cfg.get('left', [0.0] * len(name_list)),
-            dtype=np.float32,
-        )
-        deadband_right = np.asarray(
-            command_delta_deadband_cfg.get('right', [0.0] * len(name_list)),
-            dtype=np.float32,
-        )
-        if deadband_left.shape[0] != len(name_list) or deadband_right.shape[0] != len(name_list):
-            rospy.logwarn(
-                "command_delta_deadband left/right size mismatch; disabling command delta deadband."
-            )
-            command_delta_deadband_enabled = False
-        elif np.any(deadband_left < 0.0) or np.any(deadband_right < 0.0):
-            rospy.logwarn(
-                "command_delta_deadband thresholds must be non-negative; disabling command delta deadband."
-            )
-            command_delta_deadband_enabled = False
-        else:
-            command_delta_deadband_left = deadband_left
-            command_delta_deadband_right = deadband_right
-            rospy.loginfo(
-                "Command delta deadband enabled: "
-                f"left={deadband_left.tolist()} right={deadband_right.tolist()}"
-            )
-    gripper_hysteresis_cfg = cfg['ros'].get('gripper_hysteresis', {})
-    gripper_hysteresis = (GripperHysteresis(gripper_hysteresis_cfg)
-                          if gripper_hysteresis_cfg.get('enabled', False) else None)
-    if gripper_hysteresis is not None and gripper_threshold_enabled:
-        raise ValueError('gripper_hysteresis and gripper_threshold cannot both be enabled')
-    if gripper_hysteresis is not None and command_publish_mode != 'direct':
-        raise ValueError('gripper_hysteresis requires direct command publishing')
-    gripper_close_thresholds = np.asarray(gripper_threshold_cfg.get('close_threshold', [0.004, 0.004]), dtype=np.float32)
-    gripper_open_thresholds = np.asarray(gripper_threshold_cfg.get('open_threshold', [0.020, 0.020]), dtype=np.float32)
-    gripper_close_values = np.asarray(gripper_threshold_cfg.get('close_value', [-0.0037, -0.0033]), dtype=np.float32)
-    gripper_open_values = np.asarray(gripper_threshold_cfg.get('open_value', [0.058, 0.059]), dtype=np.float32)
-    if gripper_threshold_enabled:
-        if (
-            gripper_close_thresholds.shape[0] != 2
-            or gripper_open_thresholds.shape[0] != 2
-            or gripper_close_values.shape[0] != 2
-            or gripper_open_values.shape[0] != 2
-        ):
-            rospy.logwarn(
-                "gripper_threshold close_threshold/open_threshold/close_value/open_value must each contain "
-                "two values [left, right]; disabling gripper thresholding."
-            )
-            gripper_threshold_enabled = False
-        elif np.any(gripper_close_thresholds >= gripper_open_thresholds):
-            rospy.logwarn(
-                "gripper_threshold close_threshold must be smaller than open_threshold; "
-                "disabling gripper thresholding."
-            )
-            gripper_threshold_enabled = False
-        else:
-            rospy.loginfo(
-                "Gripper threshold output enabled: "
-                f"close_threshold={gripper_close_thresholds.tolist()} "
-                f"open_threshold={gripper_open_thresholds.tolist()} "
-                f"close_value={gripper_close_values.tolist()} "
-                f"open_value={gripper_open_values.tolist()}"
-            )
-    if gripper_delta_scale_enabled:
-        rospy.loginfo(
-            "Gripper delta scaling enabled: "
-            f"left_gain={gripper_delta_gains[0]:.3f} "
-            f"right_gain={gripper_delta_gains[1]:.3f} "
-            f"clip_min={None if gripper_delta_clip_min is None else gripper_delta_clip_min.tolist()} "
-            f"clip_max={None if gripper_delta_clip_max is None else gripper_delta_clip_max.tolist()}"
-        )
-    if action_filter_enabled:
-        deadband = np.asarray(action_filter_cfg.get('deadband', [0.0] * len(name_list)), dtype=np.float32)
-        if deadband.shape[0] != len(name_list):
-            rospy.logwarn("action_filter.deadband size mismatch; disabling deadband.")
-            deadband = np.zeros(len(name_list), dtype=np.float32)
-        action_deadband_left = deadband
-        action_deadband_right = deadband
-        rospy.loginfo(
-            f"Action target EMA filter enabled: alpha={action_filter_alpha:.3f} "
-            f"deadband={deadband.tolist()}"
-        )
-    if chunk_smoothing_enabled:
-        rospy.loginfo(
-            "DreamZero action chunk smoothing enabled: "
-            f"cubic_upsample={chunk_smoothing_upsample}x "
-            f"savgol_window={chunk_smoothing_window} "
-            f"polyorder={chunk_smoothing_polyorder}"
-        )
-    if terminal_filter_enabled:
-        rospy.loginfo(
-            "Chunk terminal displacement filter enabled: "
-            f"left_threshold={terminal_filter_left_threshold.tolist()} "
-            f"right_threshold={terminal_filter_right_threshold.tolist()}"
-        )
-    if first_action_delta_scale_enabled:
-        rospy.loginfo(
-            "First consumed action delta scaling enabled: "
-            f"coefficient={first_action_delta_scale_coefficient:.3f} "
-            f"include_gripper={first_action_delta_scale_include_gripper}"
-        )
-    if initial_pose_override_enabled:
-        rospy.loginfo(
-            "Initial-pose delta override enabled: "
-            f"arms={sorted(initial_pose_override_arms)} "
-            f"include_gripper={initial_pose_override_include_gripper}"
-        )
-    if temporal_ensemble_enabled:
-        rospy.loginfo(
-            "Exponential temporal ensemble enabled: "
-            f"exp_decay={temporal_exp_decay:.3f} "
-            f"max_history_chunks={temporal_max_history_chunks} "
-            f"max_candidate_age={temporal_max_candidate_age} "
-            f"min_action_index={temporal_min_action_index} "
-            f"overlap_steps={temporal_overlap_steps} "
-            f"latency_compensation={latency_comp_enabled} "
-            f"latency_mode={latency_comp_mode} "
-            f"fixed_steps={latency_fixed_steps} "
-            f"max_steps={latency_max_steps}"
-        )
-    if interpolation_enabled:
-        if interpolation_mode == 'adaptive_delta':
-            rospy.loginfo(
-                "Adaptive delta chunk interpolation enabled: "
-                f"source_steps_to_execute={adaptive_source_steps_to_execute} "
-                f"source_overlap_steps={adaptive_source_overlap_steps} "
-                f"min_factor={adaptive_min_factor} max_factor={adaptive_max_factor} "
-                f"initial_bridge_enabled={adaptive_bridge_enabled} "
-                f"initial_bridge_max_factor={adaptive_bridge_max_factor} "
-                f"joint_threshold={adaptive_joint_threshold}"
-            )
-        else:
-            rospy.loginfo(f"Linear chunk interpolation enabled: factor={interpolation_factor:.3f}")
-    if home_cfg:
+            self.published_first_command = True
+
+    def move_home(self):
+        """Run ``ros.home_position``; returns ``False`` if inference must not start."""
+        home_cfg = self.cfg['ros'].get('home_position')
+        if not home_cfg:
+            return True
+        step_lengths = self.cfg['ros'].get('arm_steps_length', [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.2])
         try:
             step_arr = np.asarray(step_lengths, dtype=np.float32)
-            if step_arr.shape[0] != len(name_list):
-                rospy.logwarn("arm_steps_length size mismatch; using uniform step length 0.01.")
-                step_arr = np.full(len(name_list), 0.01, dtype=np.float32)
-
+            if step_arr.shape[0] != len(self.name_list):
+                self.log.warn("arm_steps_length size mismatch; using uniform step length 0.01.")
+                step_arr = np.full(len(self.name_list), 0.01, dtype=np.float32)
             require_home_settle = bool(home_cfg.get('require_settle', False))
             home_ok = True
             home_sequence = home_cfg.get('sequence')
             if home_sequence:
                 for phase_index, phase_cfg in enumerate(home_sequence):
                     phase_ok = execute_home_phase(
-                        pub_l,
-                        pub_r,
-                        name_list,
-                        step_arr,
-                        home_cfg,
-                        phase_cfg,
-                        phase_index,
-                    )
+                        self.pub_l, self.pub_r, self.name_list, step_arr, home_cfg, phase_cfg, phase_index)
                     home_ok = home_ok and bool(phase_ok)
                     if require_home_settle and not phase_ok:
                         break
             else:
                 home_ok = execute_home_phase(
-                    pub_l,
-                    pub_r,
-                    name_list,
-                    step_arr,
-                    home_cfg,
-                    home_cfg,
-                    default_rate_hz=rate_hz,
-                )
+                    self.pub_l, self.pub_r, self.name_list, step_arr, home_cfg, home_cfg,
+                    default_rate_hz=self.rate_hz)
             if require_home_settle and not home_ok:
-                rospy.logerr("Home position did not settle; stopping before policy inference.")
-                return
+                self.log.error("Home position did not settle; stopping before policy inference.")
+                return False
             post_sleep_sec = max(float(home_cfg.get('post_sleep_sec', 0.0)), 0.0)
             if post_sleep_sec > 0.0:
-                rospy.loginfo(f"Waiting {post_sleep_sec:.2f}s after home before inference.")
+                self.log.info(f"Waiting {post_sleep_sec:.2f}s after home before inference.")
                 rospy.sleep(post_sleep_sec)
         except (KeyError, ValueError, TypeError):
-            rospy.logwarn("Invalid home_position configuration; skipping home move.")
+            self.log.warn("Invalid home_position configuration; skipping home move.")
+        return True
 
-    # ZeroMQ client
-    ctx = zmq.Context.instance()
-    connect_addr = cfg['zmq'].get('client_connect', 'tcp://127.0.0.1:5557')
-    socket_type = cfg['zmq'].get('socket_type', 'req')
-    recv_timeout_ms = max(int(1000 / rate_hz), 1)
-    sock = make_policy_socket(ctx, connect_addr, recv_timeout_ms, socket_type)
-    rospy.loginfo(f"Policy server endpoint set to {connect_addr} using ZMQ {socket_type.upper()}")
+    # --- policy requests --------------------------------------------------
 
-    rate = rospy.Rate(rate_hz)
-    dt = 1.0 / rate_hz / 4.0
-    integrated_left = None
-    integrated_right = None
-    last_response_wait_warn = 0.0
-    last_obs_wait_warn = 0.0
-    last_command_left = None
-    last_command_right = None
-    filtered_policy_left = None
-    filtered_policy_right = None
-    chunk_history = []
-    global_action_step = 0
-    action_logger, action_log_path = make_action_logger(cfg, rate_hz)
-    rollout_logger = make_rollout_dataset_logger(cfg, rate_hz)
-    request_id = 0
-    command_left = None
-    command_right = None
-    pending_request = None
-    last_request_camera_seq = None
-    last_stale_obs_warn = 0.0
-    last_stale_joint_warn = 0.0
-    rospy.loginfo(
-        "Async policy loop enabled: "
-        f"request_check_period={1.0 / rate_hz:.3f}s; "
-        "continuing to publish available chunk actions while waiting for policy responses; "
-        "policy requests are checked on each global step and wait for fresh front/left/right images; "
-        f"when_live_chunk={policy_request_when_live_chunk}; "
-        f"initial_action_skip_steps={initial_action_skip_steps}; "
-        f"chunk_action_skip_steps={chunk_action_skip_steps}; "
-        f"policy_gripper_input_mode={policy_gripper_input_mode}."
-    )
-
-    def chunk_live_steps(chunk):
-        steps = int(chunk.get('steps_to_execute', chunk['left'].shape[0]))
-        skip = int(chunk.get('action_skip_steps', 0))
-        return min(steps + skip, int(chunk['left'].shape[0]))
-
-    def live_chunks_for_step(step):
-        return [
-            chunk for chunk in chunk_history
-            if 0 <= step - chunk['start_step'] < chunk_live_steps(chunk)
-        ]
-
-    def select_chunk_for_step(step):
-        live_chunks = live_chunks_for_step(step)
-        if not live_chunks:
-            return None
-        if not temporal_ensemble_enabled or temporal_min_action_index <= 0:
-            return live_chunks[-1]
-        mature_chunks = [
-            chunk for chunk in live_chunks
-            if step - chunk['start_step'] >= temporal_min_action_index
-        ]
-        if mature_chunks:
-            return mature_chunks[-1]
-        return live_chunks[0]
-
-    def make_policy_gripper_input(measured_left, measured_right):
-        measured_left_arr = np.asarray(measured_left, dtype=np.float32)
-        measured_right_arr = np.asarray(measured_right, dtype=np.float32)
-        policy_left = measured_left_arr.copy()
-        policy_right = measured_right_arr.copy()
-
-        commanded_left_gripper = None
-        commanded_right_gripper = None
-        if last_command_left is not None and len(last_command_left) > 0:
-            commanded_left_gripper = float(last_command_left[-1])
-        elif command_left is not None and len(command_left) > 0:
-            commanded_left_gripper = float(command_left[-1])
-        if last_command_right is not None and len(last_command_right) > 0:
-            commanded_right_gripper = float(last_command_right[-1])
-        elif command_right is not None and len(command_right) > 0:
-            commanded_right_gripper = float(command_right[-1])
-
-        def choose(measured_value, commanded_value):
-            if commanded_value is None or policy_gripper_input_mode == 'measured':
-                return float(measured_value), 'measured'
-            if policy_gripper_input_mode == 'commanded':
-                return float(commanded_value), 'commanded'
-            if abs(float(measured_value) - float(commanded_value)) <= policy_gripper_input_hybrid_max_error:
-                return float(commanded_value), 'commanded'
-            return float(measured_value), 'measured'
-
-        left_value, left_source = choose(measured_left_arr[-1], commanded_left_gripper)
-        right_value, right_source = choose(measured_right_arr[-1], commanded_right_gripper)
-        policy_left[-1] = left_value
-        policy_right[-1] = right_value
-        info = {
-            'mode': policy_gripper_input_mode,
-            'hybrid_max_error': policy_gripper_input_hybrid_max_error,
-            'left_source': left_source,
-            'right_source': right_source,
-            'left_measured': float(measured_left_arr[-1]),
-            'right_measured': float(measured_right_arr[-1]),
-            'left_policy': float(policy_left[-1]),
-            'right_policy': float(policy_right[-1]),
-            'left_commanded': commanded_left_gripper,
-            'right_commanded': commanded_right_gripper,
-        }
-        return policy_left, policy_right, info
-
-    def send_policy_request(pkt, fresh_camera_count, forced_fresh_fallback=False):
-        nonlocal pending_request, last_request_camera_seq
-
+    def send_policy_request(self, pkt, fresh_camera_count, forced_fresh_fallback=False):
         measured_left = np.asarray(pkt['jleft'], dtype=np.float32)
         measured_right = np.asarray(pkt['jright'], dtype=np.float32)
-        policy_left, policy_right, gripper_input_info = make_policy_gripper_input(
-            measured_left,
-            measured_right,
-        )
+        commanded_left = None
+        commanded_right = None
+        if self.command_left is not None and len(self.command_left) > 0:
+            commanded_left = float(self.command_left[-1])
+        if self.command_right is not None and len(self.command_right) > 0:
+            commanded_right = float(self.command_right[-1])
+        policy_left, policy_right, gripper_input_info = self.gripper_input.apply(
+            measured_left, measured_right, commanded_left, commanded_right)
 
         header = {
             'task_prompt': pkt['task_prompt'],
-            'episode_start': request_id == 0,
+            'episode_start': self.scheduler.request_id == 0,
             'jleft': policy_left.tolist(),
             'jright': policy_right.tolist(),
-            'control_hz': rate_hz,
-            'action_mode': action_mode,
+            'control_hz': self.rate_hz,
+            'action_mode': self.action_mode,
             'policy_gripper_input': gripper_input_info,
             'measured_jleft_gripper': float(measured_left[-1]),
             'measured_jright_gripper': float(measured_right[-1]),
         }
-        if pkt.get('xvla_proprio') is not None:
-            header['xvla_proprio'] = pkt['xvla_proprio']
-        if pkt.get('current_eef_left') is not None:
-            header['current_eef_left'] = pkt['current_eef_left']
-        if pkt.get('current_eef_right') is not None:
-            header['current_eef_right'] = pkt['current_eef_right']
-        if use_base and pkt['odom'] is not None:
+        for key in ('xvla_proprio', 'current_eef_left', 'current_eef_right'):
+            if pkt.get(key) is not None:
+                header[key] = pkt[key]
+        if self.use_base and pkt['odom'] is not None:
             header['odom'] = pkt['odom']
 
-        frames = [
-            json.dumps(header, separators=(',', ':')).encode('utf-8'),
-            pkt['front'],
-            pkt['left'],
-            pkt['right'],
-        ]
-        policy_request_step = global_action_step
+        frames = [json.dumps(header, separators=(',', ':')).encode('utf-8')] + [pkt[key] for key in CAMERA_KEYS]
+        request_step = self.scheduler.step
         request_snapshot_dir = save_request_snapshot(
-            action_logger,
-            policy_request_step,
-            pkt,
-            header,
-            fresh_camera_count,
-            forced_fresh_fallback,
-        )
-        try:
-            sock.send_multipart(frames)
-        except zmq.error.Again:
-            rospy.logwarn("ZeroMQ send timeout; will retry next cycle.")
+            self.action_logger, request_step, pkt, header, fresh_camera_count, forced_fresh_fallback)
+        if not self.client.send(frames):
             return False
-
         rollout_sample_dir = save_rollout_observation(
-            rollout_logger,
-            policy_request_step,
-            pkt,
-            header,
-            fresh_camera_count,
-            forced_fresh_fallback,
-        )
+            self.rollout_logger, request_step, pkt, header, fresh_camera_count, forced_fresh_fallback)
 
-        if eef_action_mode and pkt.get('current_eef_left') is not None and pkt.get('current_eef_right') is not None:
+        if self.eef_action_mode and pkt.get('current_eef_left') is not None and pkt.get('current_eef_right') is not None:
             request_current_left = np.asarray(pkt['current_eef_left'], dtype=np.float32)
             request_current_right = np.asarray(pkt['current_eef_right'], dtype=np.float32)
             measured_current_left = request_current_left.copy()
@@ -1234,8 +676,8 @@ def main():
             measured_current_left = measured_left.copy()
             measured_current_right = measured_right.copy()
 
-        pending_request = {
-            'step': policy_request_step,
+        self.client.mark_pending({
+            'step': request_step,
             'time': time.monotonic(),
             'current_left': request_current_left.copy(),
             'current_right': request_current_right.copy(),
@@ -1248,1008 +690,438 @@ def main():
             'fresh_camera_forced': bool(forced_fresh_fallback),
             'request_snapshot_dir': request_snapshot_dir,
             'rollout_sample_dir': rollout_sample_dir,
-        }
-        last_request_camera_seq = tuple(pkt['obs_seq'][key] for key in CAMERA_KEYS)
+        })
+        self.request_gate.mark_sent(tuple(pkt['obs_seq'][key] for key in CAMERA_KEYS))
         if forced_fresh_fallback:
-            rospy.logwarn(
+            self.log.warn(
                 "Sending policy request before all cameras refreshed to avoid action starvation: "
-                f"fresh_camera_count={fresh_camera_count}/3 seq={last_request_camera_seq}"
+                f"fresh_camera_count={fresh_camera_count}/3 seq={self.request_gate.last_camera_seq}"
             )
-        rospy.loginfo_once(
-            f"Sent first policy request to {connect_addr}; async action loop is running."
+        self.log.info_once(
+            'first_request', f"Sent first policy request to {self.client.connect_addr}; async action loop is running."
         )
         return True
 
-    def obs_is_fresh_enough(pkt):
+    def maybe_send_request(self):
+        pkt = snapshot(self.task_prompt, use_base=self.use_base, include_eef=self.eef_action_mode)
+        if pkt is None:
+            return
+        stale_obs = stale_observations(
+            pkt['obs_time'], time.monotonic(), self.max_image_age_sec, self.max_joint_age_sec, CAMERA_KEYS)
+        if stale_obs:
+            now = time.monotonic()
+            if now - self.last_stale_obs_warn >= 1.0:
+                formatted = [f"{key}={age:.3f}s" if age is not None else f"{key}=None" for key, age in stale_obs]
+                self.log.warn(f"Delaying policy request because observations are stale: {formatted}")
+                self.last_stale_obs_warn = now
+            return
+        camera_seq = tuple(pkt['obs_seq'][key] for key in CAMERA_KEYS)
+        live = self.scheduler.live_chunks()
+        remaining_steps = self.scheduler.remaining_steps(live)
+        last_seq = self.request_gate.last_camera_seq
+        decision, fresh = self.request_gate.decide(camera_seq, bool(live), remaining_steps)
+        if decision in ('send', 'force'):
+            self.send_policy_request(pkt, fresh, forced_fresh_fallback=decision == 'force')
+            return
         now = time.monotonic()
-        stale = []
-        if max_image_age_sec > 0.0:
-            for key in CAMERA_KEYS:
-                age = None if pkt['obs_time'].get(key) is None else now - pkt['obs_time'][key]
-                if age is None or age > max_image_age_sec:
-                    stale.append((key, age))
-        if max_joint_age_sec > 0.0:
-            for key in ('jl', 'jr'):
-                age = None if pkt['obs_time'].get(key) is None else now - pkt['obs_time'][key]
-                if age is None or age > max_joint_age_sec:
-                    stale.append((key, age))
-        return len(stale) == 0, stale
-
-    def ingest_policy_response(rep_frames, pending_snapshot):
-        nonlocal chunk_history, global_action_step, request_id
-
-        policy_request_step = pending_snapshot['step']
-        policy_latency_sec = time.monotonic() - pending_snapshot['time']
-        if latency_comp_enabled:
-            if latency_comp_mode == 'fixed':
-                policy_latency_steps = latency_fixed_steps
+        if now - self.last_stale_obs_warn >= 2.0:
+            if decision == 'wait_chunk':
+                self.log.info(
+                    "Delaying policy request until current chunk is fully consumed: "
+                    f"remaining_steps={remaining_steps}"
+                )
             else:
-                policy_latency_steps = int(round(policy_latency_sec * rate_hz))
-            policy_latency_steps = max(policy_latency_steps, 0)
-            if latency_max_steps is not None:
-                policy_latency_steps = min(policy_latency_steps, latency_max_steps)
-            # Late responses contain actions for times that have already passed.
-            # Skip those young indices and consume the chunk at the current global step.
-            global_action_step = max(global_action_step, policy_request_step + policy_latency_steps)
-        else:
-            policy_latency_steps = 0
-        if initial_action_skip_steps > 0 and request_id == 0:
-            global_action_step = max(global_action_step, policy_request_step + initial_action_skip_steps)
+                self.log.info(
+                    "Delaying policy request until all camera images refresh: "
+                    f"last={last_seq} current={camera_seq} "
+                    f"fresh={fresh}/3 remaining_steps={remaining_steps}"
+                )
+            self.last_stale_obs_warn = now
 
+    # --- policy responses ---------------------------------------------------
+
+    def ingest_policy_response(self, rep_frames, request):
+        request_step = request['step']
+        policy_latency_sec = time.monotonic() - request['time']
+        policy_latency_steps = self.scheduler.begin_response(request_step, policy_latency_sec)
         try:
-            rep_header = json.loads(rep_frames[0].decode('utf-8'))
-        except (IndexError, json.JSONDecodeError, UnicodeDecodeError):
-            rospy.logwarn("Invalid policy response header.")
+            response = parse_action_response(rep_frames, self.action_mode, self.log)
+            processed = self.pipeline.process(
+                response['left'], response['right'], response['vel'],
+                self.command_left, self.command_right,
+                request.get('measured_current_left', request['current_left']),
+                request.get('measured_current_right', request['current_right']),
+            )
+        except InvalidPolicyResponse as exc:
+            (self.log.error if exc.level == 'error' else self.log.warn)(str(exc))
             return
-        try:
-            validate_policy_action_mode(rep_header, action_mode)
-        except ValueError as exc:
-            rospy.logerr(str(exc))
+        except ChunkRejected as exc:
+            self.log.warn(str(exc))
             return
 
-        chunk_size = int(rep_header.get('chunk_size', 0))
-        if chunk_size == 0 or len(rep_frames) < 3:
-            rospy.logwarn("Empty or incomplete policy response.")
-            return
-        received_chunk_size = chunk_size
-
-        left_stride = int(rep_header.get('left_stride', 7))
-        right_stride = int(rep_header.get('right_stride', 7))
-        left_arr = np.frombuffer(rep_frames[1], dtype=np.float32, count=chunk_size * left_stride)
-        right_arr = np.frombuffer(rep_frames[2], dtype=np.float32, count=chunk_size * right_stride)
-        try:
-            left_mat = left_arr.reshape((chunk_size, left_stride))
-            right_mat = right_arr.reshape((chunk_size, right_stride))
-        except ValueError:
-            rospy.logwarn("Invalid action matrix shape.")
-            return
-        received_left_mat = left_mat.copy()
-        received_right_mat = right_mat.copy()
-        if chunk_lowpass_enabled:
-            try:
-                left_mat, right_mat = lowpass_dual_action_chunks_zero_phase(
-                    left_mat,
-                    right_mat,
-                    sample_rate_hz=chunk_lowpass_sample_rate_hz,
-                    cutoff_hz=chunk_lowpass_cutoff_hz,
-                    order=chunk_lowpass_order,
-                    preserve_endpoints=chunk_lowpass_preserve_endpoints,
-                    include_gripper=chunk_lowpass_include_gripper,
-                )
-            except ValueError as exc:
-                rospy.logwarn(f"Chunk low-pass skipped: {exc}")
-                return
-            lowpass_delta = np.concatenate(
-                (left_mat[:, :-1] - received_left_mat[:, :-1],
-                 right_mat[:, :-1] - received_right_mat[:, :-1]),
-                axis=1,
-            )
-            rospy.loginfo(
-                "Filtered chunk-wide high-frequency motion: "
-                f"cutoff_hz={chunk_lowpass_cutoff_hz:.3f} "
-                f"sample_rate_hz={chunk_lowpass_sample_rate_hz:.3f} "
-                f"order={chunk_lowpass_order} "
-                f"rms_delta={float(np.sqrt(np.mean(lowpass_delta ** 2))):.6f} "
-                f"max_delta={float(np.max(np.abs(lowpass_delta))):.6f}"
-            )
-        lowpass_left_mat = left_mat.copy()
-        lowpass_right_mat = right_mat.copy()
-        if chunk_monotonic_enabled:
-            monotonic_before_left = left_mat.copy()
-            monotonic_before_right = right_mat.copy()
-            try:
-                if 'left' in chunk_monotonic_arms:
-                    left_mat = project_action_chunk_monotonic_to_endpoint(
-                        left_mat,
-                        command_left,
-                        strength=chunk_monotonic_strength,
-                        min_terminal_delta=chunk_monotonic_min_terminal_delta,
-                        include_gripper=chunk_monotonic_include_gripper,
-                    )
-                if 'right' in chunk_monotonic_arms:
-                    right_mat = project_action_chunk_monotonic_to_endpoint(
-                        right_mat,
-                        command_right,
-                        strength=chunk_monotonic_strength,
-                        min_terminal_delta=chunk_monotonic_min_terminal_delta,
-                        include_gripper=chunk_monotonic_include_gripper,
-                    )
-            except ValueError as exc:
-                rospy.logwarn(f"Chunk monotonic projection skipped: {exc}")
-                return
-            monotonic_delta = np.concatenate(
-                (left_mat[:, :-1] - monotonic_before_left[:, :-1],
-                 right_mat[:, :-1] - monotonic_before_right[:, :-1]),
-                axis=1,
-            )
-            rospy.loginfo(
-                "Suppressed chunk-internal joint reversals: "
-                f"arms={sorted(chunk_monotonic_arms)} "
-                f"strength={chunk_monotonic_strength:.3f} "
-                f"rms_delta={float(np.sqrt(np.mean(monotonic_delta ** 2))):.6f} "
-                f"max_delta={float(np.max(np.abs(monotonic_delta))):.6f}"
-            )
-        monotonic_left_mat = left_mat.copy()
-        monotonic_right_mat = right_mat.copy()
-        if chunk_smoothing_enabled:
-            left_mat, right_mat = smooth_dual_action_chunks_savgol(
-                left_mat,
-                right_mat,
-                upsample_factor=chunk_smoothing_upsample,
-                window_length=chunk_smoothing_window,
-                polyorder=chunk_smoothing_polyorder,
-            )
-
-        vel_mat = None
-        next_frame_idx = 3
-        if rep_header.get('has_vel', False) and len(rep_frames) > next_frame_idx:
-            vel_arr = np.frombuffer(rep_frames[next_frame_idx], dtype=np.float32, count=chunk_size * 2)
-            try:
-                vel_mat = vel_arr.reshape((chunk_size, 2))
-            except ValueError:
-                vel_mat = None
-            next_frame_idx += 1
-
-        model_raw_left_mat = None
-        model_raw_right_mat = None
-        if rep_header.get('has_model_raw_action', False):
-            raw_left_stride = int(rep_header.get('model_raw_left_stride', left_stride))
-            raw_right_stride = int(rep_header.get('model_raw_right_stride', right_stride))
-            if len(rep_frames) >= next_frame_idx + 2:
-                raw_left_arr = np.frombuffer(
-                    rep_frames[next_frame_idx],
-                    dtype=np.float32,
-                    count=chunk_size * raw_left_stride,
-                )
-                raw_right_arr = np.frombuffer(
-                    rep_frames[next_frame_idx + 1],
-                    dtype=np.float32,
-                    count=chunk_size * raw_right_stride,
-                )
-                try:
-                    model_raw_left_mat = raw_left_arr.reshape((chunk_size, raw_left_stride))
-                    model_raw_right_mat = raw_right_arr.reshape((chunk_size, raw_right_stride))
-                except ValueError:
-                    rospy.logwarn("Invalid model raw action matrix shape; skipping model_raw_action save.")
-                    model_raw_left_mat = None
-                    model_raw_right_mat = None
-            else:
-                rospy.logwarn("Policy response header has_model_raw_action=true but raw action frames are missing.")
-
-        request_temporal_overlap_steps = temporal_overlap_steps
-        initial_bridge_factor = 1
-        initial_bridge_added_steps = 0
-        if interpolation_enabled and interpolation_mode == 'adaptive_delta':
-            try:
-                left_mat, right_mat, source_to_expanded, segment_factors = adaptive_delta_upsample_chunks(
-                    left_mat,
-                    right_mat,
-                    adaptive_min_factor,
-                    adaptive_max_factor,
-                    adaptive_joint_threshold,
-                )
-            except ValueError as exc:
-                rospy.logwarn(str(exc))
-                return
-            if vel_mat is not None:
-                vel_mat, _ = interpolate_with_segment_factors(vel_mat, segment_factors)
-            if adaptive_bridge_enabled:
-                try:
-                    left_before_bridge = left_mat.shape[0]
-                    left_mat, right_mat, source_to_expanded, initial_bridge_factor = adaptive_bridge_to_first_action(
-                        left_mat,
-                        right_mat,
-                        command_left,
-                        command_right,
-                        adaptive_min_factor,
-                        adaptive_bridge_max_factor,
-                        adaptive_joint_threshold,
-                        source_to_expanded,
-                    )
-                    if vel_mat is not None and left_mat.shape[0] > left_before_bridge:
-                        bridge_count = left_mat.shape[0] - left_before_bridge
-                        vel_mat = np.vstack([
-                            np.repeat(vel_mat[:1], bridge_count, axis=0),
-                            vel_mat,
-                        ])
-                    initial_bridge_added_steps = (
-                        left_mat.shape[0] - left_before_bridge
-                    )
-                    if initial_bridge_added_steps > 0:
-                        rospy.loginfo(
-                            "Inserted chunk-boundary bridge: "
-                            f"factor={initial_bridge_factor} "
-                            f"added_steps={initial_bridge_added_steps}"
-                        )
-                except ValueError as exc:
-                    rospy.logwarn(str(exc))
-                    return
-            chunk_size = int(left_mat.shape[0])
-            if adaptive_source_steps_to_execute is not None:
-                source_idx = min(adaptive_source_steps_to_execute - 1, len(source_to_expanded) - 1)
-                steps_to_execute = source_to_expanded[source_idx] + 1
-            else:
-                steps_to_execute = chunk_size if open_loop_steps is None else min(open_loop_steps, chunk_size)
-            if adaptive_source_overlap_steps is not None:
-                if adaptive_source_overlap_steps <= 0:
-                    request_temporal_overlap_steps = 0
-                else:
-                    source_idx = min(adaptive_source_overlap_steps - 1, len(source_to_expanded) - 1)
-                    request_temporal_overlap_steps = source_to_expanded[source_idx] + 1
-        else:
-            if interpolation_enabled and interpolation_factor > 1.0:
-                left_mat = linear_upsample_chunk(left_mat, interpolation_factor)
-                right_mat = linear_upsample_chunk(right_mat, interpolation_factor)
-                if vel_mat is not None:
-                    vel_mat = linear_upsample_chunk(vel_mat, interpolation_factor)
-                chunk_size = int(left_mat.shape[0])
-            steps_to_execute = chunk_size if open_loop_steps is None else min(open_loop_steps, chunk_size)
-
-        terminal_delta_left = np.zeros(left_mat.shape[1], dtype=np.float32)
-        terminal_delta_right = np.zeros(right_mat.shape[1], dtype=np.float32)
-        terminal_cancel_left = np.zeros(left_mat.shape[1], dtype=bool)
-        terminal_cancel_right = np.zeros(right_mat.shape[1], dtype=bool)
-        terminal_endpoint_index = min(max(int(steps_to_execute), 1), chunk_size) - 1
-        if terminal_filter_enabled:
-            initial_left = pending_snapshot.get('measured_current_left', pending_snapshot['current_left'])
-            initial_right = pending_snapshot.get('measured_current_right', pending_snapshot['current_right'])
-            try:
-                (
-                    left_mat,
-                    right_mat,
-                    terminal_delta_left,
-                    terminal_delta_right,
-                    terminal_cancel_left,
-                    terminal_cancel_right,
-                    terminal_endpoint_index,
-                ) = filter_chunk_by_terminal_displacement(
-                    left_mat,
-                    right_mat,
-                    initial_left,
-                    initial_right,
-                    steps_to_execute,
-                    terminal_filter_left_threshold,
-                    terminal_filter_right_threshold,
-                )
-            except ValueError as exc:
-                rospy.logwarn(f"Chunk terminal displacement filter skipped: {exc}")
-            else:
-                rospy.loginfo(
-                    "Chunk terminal displacement filter: "
-                    f"endpoint_index={terminal_endpoint_index} "
-                    f"left_cancelled={np.flatnonzero(terminal_cancel_left).tolist()} "
-                    f"right_cancelled={np.flatnonzero(terminal_cancel_right).tolist()}"
-                )
-
-        action_skip_steps = min(chunk_action_skip_steps, max(chunk_size - 1, 0))
+        action_skip_steps = processed['action_skip_steps']
         if action_skip_steps > 0:
-            global_action_step = max(global_action_step, policy_request_step + action_skip_steps)
-            rospy.loginfo(
+            self.scheduler.skip_chunk_start(request_step, action_skip_steps)
+            self.log.info(
                 f"Skipping first {action_skip_steps} action step(s) of policy chunk "
                 f"to avoid chunk-boundary transients."
             )
 
-        request_id += 1
-        new_chunk = {
+        request_id = self.scheduler.next_request_id()
+        chunk = dict(processed)
+        chunk.update(self.pipeline.metadata())
+        chunk.update(self.shaper.metadata())
+        model_raw_left = response['model_raw_left']
+        model_raw_right = response['model_raw_right']
+        chunk.update({
             'request_id': request_id,
-            'start_step': policy_request_step,
-            'left': left_mat.copy(),
-            'right': right_mat.copy(),
-            'received_left': received_left_mat,
-            'received_right': received_right_mat,
-            'model_raw_left': None if model_raw_left_mat is None else model_raw_left_mat.copy(),
-            'model_raw_right': None if model_raw_right_mat is None else model_raw_right_mat.copy(),
-            'vel': None if vel_mat is None else vel_mat.copy(),
-            'overlap_steps': request_temporal_overlap_steps,
+            'start_step': request_step,
+            'model_raw_left': None if model_raw_left is None else model_raw_left.copy(),
+            'model_raw_right': None if model_raw_right is None else model_raw_right.copy(),
             'executed_steps': 0,
-            'received_chunk_size': received_chunk_size,
-            'steps_to_execute': steps_to_execute,
-            'terminal_filter_enabled': terminal_filter_enabled,
-            'terminal_endpoint_index': terminal_endpoint_index,
-            'terminal_delta_left': terminal_delta_left.copy(),
-            'terminal_delta_right': terminal_delta_right.copy(),
-            'terminal_cancel_left': terminal_cancel_left.copy(),
-            'terminal_cancel_right': terminal_cancel_right.copy(),
-            'first_action_delta_scale_enabled': first_action_delta_scale_enabled,
-            'first_action_delta_scale_coefficient': first_action_delta_scale_coefficient,
-            'first_action_delta_scale_include_gripper': first_action_delta_scale_include_gripper,
-            'initial_bridge_factor': initial_bridge_factor,
-            'initial_bridge_added_steps': initial_bridge_added_steps,
-            'chunk_lowpass_enabled': chunk_lowpass_enabled,
-            'chunk_lowpass_cutoff_hz': chunk_lowpass_cutoff_hz,
-            'chunk_lowpass_sample_rate_hz': chunk_lowpass_sample_rate_hz,
-            'chunk_lowpass_order': chunk_lowpass_order,
-            'chunk_lowpass_preserve_endpoints': chunk_lowpass_preserve_endpoints,
-            'lowpass_left': lowpass_left_mat.copy(),
-            'lowpass_right': lowpass_right_mat.copy(),
-            'chunk_monotonic_enabled': chunk_monotonic_enabled,
-            'chunk_monotonic_arms': sorted(chunk_monotonic_arms),
-            'chunk_monotonic_strength': chunk_monotonic_strength,
-            'chunk_monotonic_min_terminal_delta': chunk_monotonic_min_terminal_delta,
-            'monotonic_left': monotonic_left_mat.copy(),
-            'monotonic_right': monotonic_right_mat.copy(),
-            'initial_pose_delta_override_enabled': initial_pose_override_enabled,
-            'initial_pose_delta_override_arms': sorted(initial_pose_override_arms),
-            'initial_pose_delta_override_include_gripper': initial_pose_override_include_gripper,
-            'action_skip_steps': action_skip_steps,
+            'received_chunk_size': int(response['left'].shape[0]),
             'policy_latency_sec': policy_latency_sec,
             'policy_latency_steps': policy_latency_steps,
-            'request_current_left': pending_snapshot['current_left'].copy(),
-            'request_current_right': pending_snapshot['current_right'].copy(),
-            'request_measured_left': pending_snapshot.get(
-                'measured_current_left',
-                pending_snapshot['current_left'],
-            ).copy(),
-            'request_measured_right': pending_snapshot.get(
-                'measured_current_right',
-                pending_snapshot['current_right'],
-            ).copy(),
-            'policy_gripper_input': dict(pending_snapshot.get('policy_gripper_input', {})),
-            'request_obs_seq': dict(pending_snapshot['obs_seq']),
-            'request_obs_time': dict(pending_snapshot['obs_time']),
-            'request_fresh_camera_count': int(pending_snapshot['fresh_camera_count']),
-            'request_fresh_camera_forced': bool(pending_snapshot['fresh_camera_forced']),
-            'request_snapshot_dir': pending_snapshot.get('request_snapshot_dir', ''),
-            'rollout_sample_dir': pending_snapshot.get('rollout_sample_dir', ''),
-        }
-        new_chunk['action_chunk_path'] = save_action_chunk(action_logger, request_id, new_chunk)
-        new_chunk['rollout_action_path'] = save_rollout_action(
-            rollout_logger,
-            new_chunk.get('rollout_sample_dir', ''),
-            request_id,
-            new_chunk,
-        )
-        chunk_history.append(new_chunk)
-        chunk_history = chunk_history[-temporal_max_history_chunks:]
+            'request_current_left': request['current_left'].copy(),
+            'request_current_right': request['current_right'].copy(),
+            'request_measured_left': request.get('measured_current_left', request['current_left']).copy(),
+            'request_measured_right': request.get('measured_current_right', request['current_right']).copy(),
+            'policy_gripper_input': dict(request.get('policy_gripper_input', {})),
+            'request_obs_seq': dict(request['obs_seq']),
+            'request_obs_time': dict(request['obs_time']),
+            'request_fresh_camera_count': int(request['fresh_camera_count']),
+            'request_fresh_camera_forced': bool(request['fresh_camera_forced']),
+            'request_snapshot_dir': request.get('request_snapshot_dir', ''),
+            'rollout_sample_dir': request.get('rollout_sample_dir', ''),
+        })
+        chunk['action_chunk_path'] = save_action_chunk(self.action_logger, request_id, chunk)
+        chunk['rollout_action_path'] = save_rollout_action(
+            self.rollout_logger, chunk.get('rollout_sample_dir', ''), request_id, chunk)
+        self.scheduler.add_chunk(chunk)
 
-    def publish_action_from_chunk(active_chunk):
-        global published_first_command
-        nonlocal command_left, command_right
-        nonlocal filtered_policy_left, filtered_policy_right
-        nonlocal integrated_left, integrated_right
-        nonlocal last_command_left, last_command_right
-        nonlocal global_action_step, chunk_history
-        nonlocal last_stale_joint_warn, gripper_hysteresis, last_ik_publish_time
+    # --- per-step command -----------------------------------------------------
 
-        current_chunk_start_step = active_chunk['start_step']
-        chunk_size = int(active_chunk['left'].shape[0])
-        action_index = global_action_step - current_chunk_start_step
+    def publish_step(self, chunk):
+        """Publish the action of ``chunk`` for the current step; ``False`` if skipped."""
+        scheduler = self.scheduler
+        chunk_size = int(chunk['left'].shape[0])
+        action_index = scheduler.step - chunk['start_step']
         if action_index < 0 or action_index >= chunk_size:
             return False
 
-        command_left_before = command_left.copy()
-        command_right_before = command_right.copy()
-        ik_seed_left, ik_seed_right, jl_age, jr_age = latest_joint_arrays_and_age()
-        publish_current_left = ik_seed_left
-        publish_current_right = ik_seed_right
-        if eef_action_mode:
-            publish_current_left = command_left.copy()
-            publish_current_right = command_right.copy()
-        if (
-            max_joint_age_sec > 0.0
-            and (
-                publish_current_left is None
-                or publish_current_right is None
-                or jl_age is None
-                or jr_age is None
-                or jl_age > max_joint_age_sec
-                or jr_age > max_joint_age_sec
-            )
+        command_left_before = self.command_left.copy()
+        command_right_before = self.command_right.copy()
+        seed_left, seed_right, jl_age, jr_age = latest_joint_arrays_and_age()
+        publish_current_left = seed_left
+        publish_current_right = seed_right
+        if self.eef_action_mode:
+            publish_current_left = self.command_left.copy()
+            publish_current_right = self.command_right.copy()
+        if self.max_joint_age_sec > 0.0 and (
+            publish_current_left is None or publish_current_right is None
+            or jl_age is None or jr_age is None
+            or jl_age > self.max_joint_age_sec or jr_age > self.max_joint_age_sec
         ):
             now_warn = time.monotonic()
-            if now_warn - last_stale_joint_warn >= 1.0:
-                rospy.logwarn(
+            if now_warn - self.last_stale_joint_warn >= 1.0:
+                self.log.warn(
                     "Skipping action publish because joint feedback is stale: "
                     f"jl_age={jl_age} jr_age={jr_age} "
-                    f"max_joint_age_sec={max_joint_age_sec:.3f}"
+                    f"max_joint_age_sec={self.max_joint_age_sec:.3f}"
                 )
-                last_stale_joint_warn = now_warn
+                self.last_stale_joint_warn = now_warn
             return False
         if publish_current_left is None:
-            publish_current_left = command_left.copy()
+            publish_current_left = self.command_left.copy()
         if publish_current_right is None:
-            publish_current_right = command_right.copy()
-        if delta_clip_reference == 'current':
-            clip_reference_left = publish_current_left
-            clip_reference_right = publish_current_right
-        else:
-            clip_reference_left = command_left
-            clip_reference_right = command_right
-        temporal_ensemble_count = 0
-        temporal_ensemble_weights = []
+            publish_current_right = self.command_right.copy()
 
-        if action_mode in ('absolute', 'eef_absolute'):
-            raw_target_left = active_chunk['left'][action_index]
-            raw_target_right = active_chunk['right'][action_index]
-            ensembled_target_left = raw_target_left
-            ensembled_target_right = raw_target_right
-            if (
-                temporal_ensemble_enabled
-                and (
-                    active_chunk['overlap_steps'] is None
-                    or active_chunk['executed_steps'] < active_chunk['overlap_steps']
-                )
-            ):
-                ensemble_left, ensemble_right, ensemble_count, ensemble_weights = exponential_temporal_ensemble(
-                    chunk_history,
-                    global_action_step,
-                    active_chunk['request_id'],
-                    temporal_exp_decay,
-                    temporal_max_candidate_age,
-                    temporal_min_action_index,
-                )
-                if ensemble_left is not None and ensemble_right is not None:
-                    ensembled_target_left = ensemble_left
-                    ensembled_target_right = ensemble_right
-                    temporal_ensemble_count = ensemble_count
-                    temporal_ensemble_weights = ensemble_weights
+        ensemble_count = 0
+        ensemble_weights = []
+        if self.action_mode in ('absolute', 'eef_absolute'):
+            raw_left = chunk['left'][action_index]
+            raw_right = chunk['right'][action_index]
+            ensembled_left, ensembled_right = raw_left, raw_right
+            ensemble = scheduler.ensemble(chunk)
+            if ensemble is not None:
+                ensembled_left, ensembled_right, ensemble_count, ensemble_weights = ensemble
         else:
-            # velocity mode: integrate joint velocities; the gripper stays absolute.
-            integrated_left = integrated_left + active_chunk['left'][action_index] * dt
-            integrated_right = integrated_right + active_chunk['right'][action_index] * dt
-            integrated_left[-1] = active_chunk['left'][action_index, -1]
-            integrated_right[-1] = active_chunk['right'][action_index, -1]
-            raw_target_left = integrated_left
-            raw_target_right = integrated_right
-            ensembled_target_left = raw_target_left
-            ensembled_target_right = raw_target_right
+            raw_left, raw_right = self.integrator.step(chunk['left'][action_index], chunk['right'][action_index])
+            ensembled_left, ensembled_right = raw_left, raw_right
 
-        if action_filter_enabled:
-            if filtered_policy_left is None or filtered_policy_right is None:
-                filtered_policy_left = command_left.copy()
-                filtered_policy_right = command_right.copy()
-            filtered_policy_left = (
-                action_filter_alpha * ensembled_target_left
-                + (1.0 - action_filter_alpha) * filtered_policy_left
-            )
-            filtered_policy_right = (
-                action_filter_alpha * ensembled_target_right
-                + (1.0 - action_filter_alpha) * filtered_policy_right
-            )
-            filtered_target_left = filtered_policy_left.copy()
-            filtered_target_right = filtered_policy_right.copy()
-            small_left = np.abs(filtered_target_left - command_left) < action_deadband_left
-            small_right = np.abs(filtered_target_right - command_right) < action_deadband_right
-            filtered_target_left[small_left] = command_left[small_left]
-            filtered_target_right[small_right] = command_right[small_right]
-        else:
-            filtered_target_left = ensembled_target_left
-            filtered_target_right = ensembled_target_right
-        if delta_clip_enabled:
-            target_left = clip_joint_delta(clip_reference_left, filtered_target_left, delta_clip_left)
-            target_right = clip_joint_delta(clip_reference_right, filtered_target_right, delta_clip_right)
-        else:
-            target_left = filtered_target_left
-            target_right = filtered_target_right
-
-        clipped_target_left = target_left.copy()
-        clipped_target_right = target_right.copy()
-
-        if gripper_delta_scale_enabled:
-            target_left, target_right = scale_gripper_deltas(
-                target_left,
-                target_right,
-                active_chunk.get('request_measured_left', active_chunk['request_current_left']),
-                active_chunk.get('request_measured_right', active_chunk['request_current_right']),
-                gripper_delta_gains,
-                clip_min=gripper_delta_clip_min,
-                clip_max=gripper_delta_clip_max,
-            )
-        gripper_candidate = gripper_hysteresis
-        gripper_transition = None
-        if gripper_hysteresis is not None:
-            values, gripper_candidate, gripper_transition = gripper_hysteresis.propose(
-                [target_left[-1], target_right[-1]],
-                [ik_seed_left[-1], ik_seed_right[-1]],
-                request_opening=[active_chunk['request_current_left'][-1],
-                                 active_chunk['request_current_right'][-1]],
-            )
-            target_left = target_left.copy()
-            target_right = target_right.copy()
-            target_left[-1], target_right[-1] = values
-        if gripper_threshold_enabled:
-            target_left, target_right = threshold_gripper_targets(
-                target_left,
-                target_right,
-                gripper_close_thresholds,
-                gripper_open_thresholds,
-                gripper_close_values,
-                gripper_open_values,
-            )
-        if command_delta_deadband_enabled:
-            target_left, command_delta_deadband_residual_left = apply_joint_delta_deadband(
-                command_left_before,
-                target_left,
-                command_delta_deadband_left,
-            )
-            target_right, command_delta_deadband_residual_right = apply_joint_delta_deadband(
-                command_right_before,
-                target_right,
-                command_delta_deadband_right,
-            )
-        else:
-            command_delta_deadband_residual_left = np.zeros_like(target_left, dtype=np.float32)
-            command_delta_deadband_residual_right = np.zeros_like(target_right, dtype=np.float32)
-
-        first_action_delta_scale_applied = (
-            first_action_delta_scale_enabled
-            and active_chunk['executed_steps'] == 0
+        shaped = self.shaper.shape(
+            ensembled_left, ensembled_right,
+            command_left_before, command_right_before,
+            publish_current_left, publish_current_right,
+            seed_left, seed_right,
+            chunk,
         )
-        if first_action_delta_scale_applied:
-            target_left, target_right = scale_action_delta_from_reference(
-                target_left,
-                target_right,
-                command_left_before,
-                command_right_before,
-                first_action_delta_scale_coefficient,
-                include_gripper=first_action_delta_scale_include_gripper,
-            )
+        target_left = shaped['target_left']
+        target_right = shaped['target_right']
+        clip_reference_left = shaped['clip_reference_left']
+        clip_reference_right = shaped['clip_reference_right']
+        deltas = {
+            'raw_delta': (raw_left - command_left_before, raw_right - command_right_before),
+            'applied_delta': (target_left - command_left_before, target_right - command_right_before),
+            'reference_delta': (target_left - clip_reference_left, target_right - clip_reference_right),
+            'tracking_error_before': (command_left_before - publish_current_left,
+                                      command_right_before - publish_current_right),
+            'tracking_error_after': (target_left - publish_current_left, target_right - publish_current_right),
+            'clip_residual': (raw_left - shaped['clipped_left'], raw_right - shaped['clipped_right']),
+        }
 
-        if initial_pose_override_enabled:
-            target_left, target_right = override_arm_delta_from_initial_pose(
-                target_left,
-                target_right,
-                active_chunk.get('request_measured_left', active_chunk['request_current_left']),
-                active_chunk.get('request_measured_right', active_chunk['request_current_right']),
-                initial_pose_override_left,
-                initial_pose_override_right,
-                include_gripper=initial_pose_override_include_gripper,
-            )
-
-        raw_delta_left = raw_target_left - command_left_before
-        raw_delta_right = raw_target_right - command_right_before
-        applied_delta_left = target_left - command_left_before
-        applied_delta_right = target_right - command_right_before
-        reference_delta_left = target_left - clip_reference_left
-        reference_delta_right = target_right - clip_reference_right
-        tracking_error_before_left = command_left_before - publish_current_left
-        tracking_error_before_right = command_right_before - publish_current_right
-        tracking_error_after_left = target_left - publish_current_left
-        tracking_error_after_right = target_right - publish_current_right
-        clip_residual_left = raw_target_left - clipped_target_left
-        clip_residual_right = raw_target_right - clipped_target_right
-
-        ik_joint_left = None
-        ik_joint_right = None
-        ik_left_result = None
-        ik_right_result = None
-
-        if command_publish_mode == 'direct':
-            if eef_action_mode:
-                if eef_ik is None:
-                    rospy.logerr_throttle(1.0, "EEF action mode requested but IK solver is not initialized.")
+        ik_results = None
+        if self.command_publish_mode == 'direct':
+            if self.eef_action_mode:
+                ik_results = self.ik.solve(
+                    target_left, target_right, seed_left, seed_right,
+                    command_left_before, command_right_before,
+                    context={'request_id': chunk['request_id'], 'action_index': action_index,
+                             'global_action_step': scheduler.step},
+                )
+                if ik_results is None:
                     return False
-                if 'left' not in eef_ik.calibration:
-                    eef_ik.calibrate('left', ik_seed_left, command_left_before)
-                if 'right' not in eef_ik.calibration:
-                    eef_ik.calibrate('right', ik_seed_right, command_right_before)
-                ik_elapsed = (1.0 / rate_hz if last_ik_publish_time is None
-                              else max(time.monotonic() - last_ik_publish_time, 1e-6))
-                try:
-                    ik_left_result = eef_ik.solve('left', target_left, ik_seed_left, last_published_ik.get('left'), dt=ik_elapsed)
-                    ik_right_result = eef_ik.solve('right', target_right, ik_seed_right, last_published_ik.get('right'), dt=ik_elapsed)
-                except Exception as exc:  # noqa: BLE001
-                    rospy.logwarn_throttle(1.0, f"EEF IK solve failed; skipping command publish: {exc}")
-                    return False
-                if (not ik_left_result['acceptable'] or not ik_right_result['acceptable']) and not eef_ik.publish_on_failure:
-                    if action_logger is not None:
-                        rejection = {
-                            'wall_time': time.time(), 'request_id': active_chunk['request_id'],
-                            'action_index': action_index, 'global_action_step': global_action_step,
-                            'target_left': target_left.tolist(), 'target_right': target_right.tolist(),
-                            'seed_left': ik_seed_left.tolist(), 'seed_right': ik_seed_right.tolist(),
-                            'left': {k: (v.tolist() if isinstance(v, np.ndarray) else v)
-                                     for k, v in ik_left_result.items()},
-                            'right': {k: (v.tolist() if isinstance(v, np.ndarray) else v)
-                                      for k, v in ik_right_result.items()},
-                        }
-                        try:
-                            with open(action_logger['path'] + '.rejected.jsonl', 'a', encoding='utf-8') as f:
-                                f.write(json.dumps(rejection) + '\n')
-                        except OSError as exc:
-                            rospy.logwarn_throttle(1.0, f"Cannot record rejected IK command: {exc}")
-                    rospy.logwarn_throttle(
-                        1.0,
-                        "EEF IK command rejected (pose/joint/singularity/hold constraints); skipping publish: "
-                        f"left_pos={ik_left_result['position_error_m']:.4f}m "
-                        f"left_rot={ik_left_result['orientation_error_rad']:.4f}rad "
-                        f"right_pos={ik_right_result['position_error_m']:.4f}m "
-                        f"right_rot={ik_right_result['orientation_error_rad']:.4f}rad "
-                        f"left_solution_pos={ik_left_result['solution_position_error_m']:.4f}m "
-                        f"right_solution_pos={ik_right_result['solution_position_error_m']:.4f}m "
-                        f"joint_delta_limited={ik_left_result['joint_delta_limited']}/{ik_right_result['joint_delta_limited']} "
-                        f"wrist_guard_left={ik_left_result.get('wrist_singularity_avoidance', {})} "
-                        f"wrist_guard_right={ik_right_result.get('wrist_singularity_avoidance', {})}"
-                    )
-                    return False
-                if eef_ik.differential is not None:
-                    for arm_name, result in (('left', ik_left_result), ('right', ik_right_result)):
-                        limits = result['differential_ik']['active_limits']
-                        if any(limits.values()):
-                            message = (
-                                f"EEF IK bounded tracking {arm_name}: active_limits={limits} "
-                                f"target_reached={result['target_reached']} "
-                                f"position_error={result['position_error_m']:.4f}m "
-                                f"orientation_error={result['orientation_error_rad']:.4f}rad")
-                            if result['target_reached']:
-                                rospy.loginfo_throttle(1.0, message)
-                            else:
-                                rospy.logwarn_throttle(1.0, message)
-                elif ik_left_result.get('joint_delta_limited') or ik_right_result.get('joint_delta_limited'):
-                    rospy.logwarn_throttle(
-                        1.0,
-                        "EEF IK joint delta limited: "
-                        f"left_delta={ik_left_result.get('joint_delta_norm', 0.0):.4f} "
-                        f"left_unclipped={ik_left_result.get('unclipped_joint_delta_norm', 0.0):.4f} "
-                        f"right_delta={ik_right_result.get('joint_delta_norm', 0.0):.4f} "
-                        f"right_unclipped={ik_right_result.get('unclipped_joint_delta_norm', 0.0):.4f}"
-                    )
-                ik_joint_left = ik_left_result['joints']
-                ik_joint_right = ik_right_result['joints']
-                for arm_index, (arm_name, result, target) in enumerate((
-                    ('left', ik_left_result, target_left), ('right', ik_right_result, target_right),
-                )):
-                    if result.get('differential_ik', {}).get('mode') == 'stalled':
-                        rospy.logwarn_throttle(
-                            1.0, f"Differential IK stalled on {arm_name}: "
-                            f"position error={result['position_error_m']:.4f}m "
-                            f"orientation error={result['orientation_error_rad']:.4f}rad")
-                    if result.get('wrist_singularity_avoidance', {}).get('mode') == 'hold_last_safe':
-                        rospy.logwarn_throttle(
-                            1.0, f"Holding {arm_name} at last safe joint command: "
-                            f"model target not reached; position error={result['position_error_m']:.4f}m "
-                            f"orientation error={result['orientation_error_rad']:.4f}rad")
-                        target[-1] = result['joints'][-1]
-                        if gripper_candidate is not None:
-                            # The guard holds the previously sent gripper too;
-                            # do not commit a transition that was not published.
-                            gripper_candidate.hold(arm_index, target[-1], gripper_transition)
-                publish_joint_pair(pub_l, pub_r, name_list, ik_joint_left, ik_joint_right)
-                last_ik_publish_time = time.monotonic()
-                eef_ik.commit('left', ik_left_result)
-                eef_ik.commit('right', ik_right_result)
-                last_published_ik['left'] = ik_joint_left.copy()
-                last_published_ik['right'] = ik_joint_right.copy()
-                if not published_first_command:
-                    rospy.loginfo(
-                        f"Published first IK joint command to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
-                    )
-                    published_first_command = True
+                self.ik.apply_holds(ik_results, target_left, target_right,
+                                    shaped['gripper_candidate'], shaped['gripper_transition'])
+                publish_joint_pair(self.pub_l, self.pub_r, self.name_list,
+                                   ik_results['left']['joints'], ik_results['right']['joints'])
+                self.ik.commit(ik_results)
+                self._note_published(ik=True)
             else:
-                publish_joint_pair(pub_l, pub_r, name_list, target_left, target_right)
-                if not published_first_command:
-                    rospy.loginfo(
-                        f"Published first command to {topics['cmd_joint_left']} and {topics['cmd_joint_right']}."
-                    )
-                    published_first_command = True
+                publish_joint_pair(self.pub_l, self.pub_r, self.name_list, target_left, target_right)
+                self._note_published()
         else:
-            with command_publish_lock:
-                command_publish_state['start_time'] = time.monotonic()
-                command_publish_state['duration'] = 1.0 / float(rate_hz)
-                command_publish_state['start_left'] = command_left_before.copy()
-                command_publish_state['start_right'] = command_right_before.copy()
-                command_publish_state['target_left'] = target_left.copy()
-                command_publish_state['target_right'] = target_right.copy()
+            self.publisher.set_target(command_left_before, command_right_before, target_left, target_right)
 
-        gripper_hysteresis = gripper_candidate
-        command_left = target_left.copy()
-        command_right = target_right.copy()
-        last_command_left = command_left.copy()
-        last_command_right = command_right.copy()
+        self.shaper.commit(shaped)
+        self.command_left = target_left.copy()
+        self.command_right = target_right.copy()
 
-        vel_mat = active_chunk['vel']
-        if use_base and vel_mat is not None and pub_v is not None:
+        vel_mat = chunk['vel']
+        if self.use_base and vel_mat is not None and self.pub_v is not None:
             v = Twist()
-            v.linear.x = float(np.clip(vel_mat[action_index, 0], -v_max, v_max))
-            v.angular.z = float(np.clip(vel_mat[action_index, 1], -w_max, w_max))
-            pub_v.publish(v)
+            v.linear.x = float(np.clip(vel_mat[action_index, 0], -self.v_max, self.v_max))
+            v.angular.z = float(np.clip(vel_mat[action_index, 1], -self.w_max, self.w_max))
+            self.pub_v.publish(v)
 
-        base_vel = None
-        if vel_mat is not None:
-            base_vel = vel_mat[action_index]
+        self._log_step(
+            chunk, action_index, chunk_size, shaped, deltas, ik_results,
+            raw=(raw_left, raw_right), ensembled=(ensembled_left, ensembled_right),
+            ensemble=(ensemble_count, ensemble_weights),
+            command_before=(command_left_before, command_right_before),
+            publish_current=(publish_current_left, publish_current_right),
+            seed=(seed_left, seed_right), joint_age=(jl_age, jr_age),
+        )
+        scheduler.advance(chunk)
+        return True
+
+    def _log_step(self, chunk, action_index, chunk_size, shaped, deltas, ik_results,
+                  raw, ensembled, ensemble, command_before, publish_current, seed, joint_age):
+        if self.action_logger is None:
+            return
+        shaper = self.shaper
+        pipeline = self.pipeline
+        target = (shaped['target_left'], shaped['target_right'])
+        filtered = (shaped['filtered_left'], shaped['filtered_right'])
+        clip_reference = (shaped['clip_reference_left'], shaped['clip_reference_right'])
+        residual = (shaped['deadband_residual_left'], shaped['deadband_residual_right'])
+        ik_left = None if ik_results is None else ik_results['left']
+        ik_right = None if ik_results is None else ik_results['right']
+        request_measured = (
+            chunk.get('request_measured_left', chunk['request_current_left']),
+            chunk.get('request_measured_right', chunk['request_current_right']),
+        )
+        gripper_input = chunk.get('policy_gripper_input', {})
+        vel_mat = chunk['vel']
+        base_vel = None if vel_mat is None else vel_mat[action_index]
         now = rospy.Time.now()
         now_mono = time.monotonic()
         request_obs_age = {
             key: None if value is None else now_mono - value
-            for key, value in active_chunk['request_obs_time'].items()
+            for key, value in chunk['request_obs_time'].items()
         }
-        write_action_log(action_logger, {
+        jl_age, jr_age = joint_age
+
+        def fmt(value):
+            return f'{float(value):.6f}'
+
+        row = {
             'wall_time': f'{time.time():.6f}',
             'ros_time': f'{now.to_sec():.6f}',
-            'request_id': active_chunk['request_id'],
-            'tau': active_chunk['executed_steps'],
-            'global_action_step': global_action_step,
-            'chunk_start_step': current_chunk_start_step,
+            'request_id': chunk['request_id'],
+            'tau': chunk['executed_steps'],
+            'global_action_step': self.scheduler.step,
+            'chunk_start_step': chunk['start_step'],
             'action_index': action_index,
-            'policy_latency_sec': f"{active_chunk['policy_latency_sec']:.6f}",
-            'policy_latency_steps': active_chunk['policy_latency_steps'],
+            'policy_latency_sec': f"{chunk['policy_latency_sec']:.6f}",
+            'policy_latency_steps': chunk['policy_latency_steps'],
             'chunk_size': chunk_size,
-            'received_chunk_size': active_chunk['received_chunk_size'],
-            'steps_to_execute': active_chunk['steps_to_execute'],
+            'received_chunk_size': chunk['received_chunk_size'],
+            'steps_to_execute': chunk['steps_to_execute'],
             'discarded_steps': action_index,
-            'rate_hz': rate_hz,
-            'command_publish_rate_hz': f'{command_publish_rate_hz:.6f}',
-            'command_publish_substeps': command_publish_substeps,
-            'task_prompt': task_prompt,
-            'action_mode': action_mode,
-            'chunk_interpolation_enabled': interpolation_enabled,
-            'chunk_interpolation_mode': interpolation_mode,
-            'chunk_interpolation_factor': f'{interpolation_factor:.6f}',
-            'request_obs_seq': json.dumps(active_chunk['request_obs_seq'], separators=(',', ':')),
+            'rate_hz': self.rate_hz,
+            'command_publish_rate_hz': f'{self.command_publish_rate_hz:.6f}',
+            'command_publish_substeps': self.command_publish_substeps,
+            'task_prompt': self.task_prompt,
+            'action_mode': self.action_mode,
+            'chunk_interpolation_enabled': pipeline.interpolation_enabled,
+            'chunk_interpolation_mode': pipeline.interpolation_mode,
+            'chunk_interpolation_factor': f'{pipeline.interpolation_factor:.6f}',
+            'request_obs_seq': json.dumps(chunk['request_obs_seq'], separators=(',', ':')),
             'request_obs_age_sec': json.dumps(request_obs_age, separators=(',', ':')),
-            'request_snapshot_dir': active_chunk.get('request_snapshot_dir', ''),
-            'action_chunk_path': active_chunk.get('action_chunk_path', ''),
-            'rollout_sample_dir': active_chunk.get('rollout_sample_dir', ''),
-            'rollout_action_path': active_chunk.get('rollout_action_path', ''),
-            'request_fresh_camera_count': active_chunk['request_fresh_camera_count'],
-            'request_fresh_camera_forced': active_chunk['request_fresh_camera_forced'],
-            'delta_clip_enabled': delta_clip_enabled,
-            'delta_clip_reference': delta_clip_reference,
-            'command_delta_deadband_enabled': command_delta_deadband_enabled,
-            'first_action_delta_scale_enabled': first_action_delta_scale_enabled,
-            'first_action_delta_scale_coefficient': f'{first_action_delta_scale_coefficient:.6f}',
-            'first_action_delta_scale_include_gripper': first_action_delta_scale_include_gripper,
-            'first_action_delta_scale_applied': first_action_delta_scale_applied,
-            'initial_pose_delta_override_enabled': initial_pose_override_enabled,
-            'initial_pose_delta_override_arms': json.dumps(sorted(initial_pose_override_arms), separators=(',', ':')),
-            'initial_pose_delta_override_include_gripper': initial_pose_override_include_gripper,
-            'temporal_ensemble_count': temporal_ensemble_count,
-            'temporal_ensemble_weights': vector_to_json(temporal_ensemble_weights),
-            'current_left': vector_to_json(active_chunk['request_current_left']),
-            'current_right': vector_to_json(active_chunk['request_current_right']),
-            'request_measured_left': vector_to_json(active_chunk.get('request_measured_left', active_chunk['request_current_left'])),
-            'request_measured_right': vector_to_json(active_chunk.get('request_measured_right', active_chunk['request_current_right'])),
-            'publish_current_left': vector_to_json(publish_current_left),
-            'publish_current_right': vector_to_json(publish_current_right),
-            'clip_reference_left': vector_to_json(clip_reference_left),
-            'clip_reference_right': vector_to_json(clip_reference_right),
-            'command_left_before': vector_to_json(command_left_before),
-            'command_right_before': vector_to_json(command_right_before),
-            'raw_left': vector_to_json(raw_target_left),
-            'raw_right': vector_to_json(raw_target_right),
-            'ensembled_left': vector_to_json(ensembled_target_left),
-            'ensembled_right': vector_to_json(ensembled_target_right),
-            'filtered_left': vector_to_json(filtered_target_left),
-            'filtered_right': vector_to_json(filtered_target_right),
-            'target_left': vector_to_json(target_left),
-            'target_right': vector_to_json(target_right),
-            'ik_seed_joint_left': vector_to_json(ik_seed_left) if eef_action_mode else '',
-            'ik_seed_joint_right': vector_to_json(ik_seed_right) if eef_action_mode else '',
-            'ik_diagnostics_left': '' if ik_left_result is None else json.dumps({k: v for k, v in ik_left_result.items() if k != 'joints'}, separators=(',', ':')),
-            'ik_diagnostics_right': '' if ik_right_result is None else json.dumps({k: v for k, v in ik_right_result.items() if k != 'joints'}, separators=(',', ':')),
-            'ik_joint_left': vector_to_json(ik_joint_left),
-            'ik_joint_right': vector_to_json(ik_joint_right),
-            'ik_left_position_error_m': '' if ik_left_result is None else f"{ik_left_result['position_error_m']:.6f}",
-            'ik_right_position_error_m': '' if ik_right_result is None else f"{ik_right_result['position_error_m']:.6f}",
-            'ik_left_orientation_error_rad': '' if ik_left_result is None else f"{ik_left_result['orientation_error_rad']:.6f}",
-            'ik_right_orientation_error_rad': '' if ik_right_result is None else f"{ik_right_result['orientation_error_rad']:.6f}",
-            'raw_delta_left': vector_to_json(raw_delta_left),
-            'raw_delta_right': vector_to_json(raw_delta_right),
-            'applied_delta_left': vector_to_json(applied_delta_left),
-            'applied_delta_right': vector_to_json(applied_delta_right),
-            'reference_delta_left': vector_to_json(reference_delta_left),
-            'reference_delta_right': vector_to_json(reference_delta_right),
-            'tracking_error_before_left': vector_to_json(tracking_error_before_left),
-            'tracking_error_before_right': vector_to_json(tracking_error_before_right),
-            'tracking_error_after_left': vector_to_json(tracking_error_after_left),
-            'tracking_error_after_right': vector_to_json(tracking_error_after_right),
-            'clip_residual_left': vector_to_json(clip_residual_left),
-            'clip_residual_right': vector_to_json(clip_residual_right),
-            'command_delta_deadband_residual_left': vector_to_json(command_delta_deadband_residual_left),
-            'command_delta_deadband_residual_right': vector_to_json(command_delta_deadband_residual_right),
-            'raw_vs_publish_norm_left': norm_first_six(raw_target_left - publish_current_left),
-            'raw_vs_publish_norm_right': norm_first_six(raw_target_right - publish_current_right),
-            'ensembled_vs_publish_norm_left': norm_first_six(ensembled_target_left - publish_current_left),
-            'ensembled_vs_publish_norm_right': norm_first_six(ensembled_target_right - publish_current_right),
-            'target_vs_publish_norm_left': norm_first_six(target_left - publish_current_left),
-            'target_vs_publish_norm_right': norm_first_six(target_right - publish_current_right),
-            'reference_delta_norm_left': norm_first_six(reference_delta_left),
-            'reference_delta_norm_right': norm_first_six(reference_delta_right),
-            'applied_delta_norm_left': norm_first_six(applied_delta_left),
-            'applied_delta_norm_right': norm_first_six(applied_delta_right),
-            'tracking_error_before_norm_left': norm_first_six(tracking_error_before_left),
-            'tracking_error_before_norm_right': norm_first_six(tracking_error_before_right),
-            'tracking_error_after_norm_left': norm_first_six(tracking_error_after_left),
-            'tracking_error_after_norm_right': norm_first_six(tracking_error_after_right),
-            'clip_residual_norm_left': norm_first_six(clip_residual_left),
-            'clip_residual_norm_right': norm_first_six(clip_residual_right),
-            'command_delta_deadband_residual_norm_left': norm_first_six(command_delta_deadband_residual_left),
-            'command_delta_deadband_residual_norm_right': norm_first_six(command_delta_deadband_residual_right),
+            'request_snapshot_dir': chunk.get('request_snapshot_dir', ''),
+            'action_chunk_path': chunk.get('action_chunk_path', ''),
+            'rollout_sample_dir': chunk.get('rollout_sample_dir', ''),
+            'rollout_action_path': chunk.get('rollout_action_path', ''),
+            'request_fresh_camera_count': chunk['request_fresh_camera_count'],
+            'request_fresh_camera_forced': chunk['request_fresh_camera_forced'],
+            'delta_clip_enabled': shaper.delta_clip_enabled,
+            'delta_clip_reference': shaper.delta_clip_reference,
+            'command_delta_deadband_enabled': shaper.command_deadband_enabled,
+            'first_action_delta_scale_enabled': shaper.first_scale_enabled,
+            'first_action_delta_scale_coefficient': f'{shaper.first_scale_coefficient:.6f}',
+            'first_action_delta_scale_include_gripper': shaper.first_scale_include_gripper,
+            'first_action_delta_scale_applied': shaped['first_action_delta_scale_applied'],
+            'initial_pose_delta_override_enabled': shaper.override_enabled,
+            'initial_pose_delta_override_arms': json.dumps(sorted(shaper.override_arms), separators=(',', ':')),
+            'initial_pose_delta_override_include_gripper': shaper.override_include_gripper,
+            'temporal_ensemble_count': ensemble[0],
+            'temporal_ensemble_weights': vector_to_json(ensemble[1]),
+            'ik_seed_joint_left': vector_to_json(seed[0]) if self.eef_action_mode else '',
+            'ik_seed_joint_right': vector_to_json(seed[1]) if self.eef_action_mode else '',
             'publish_joint_age_left_sec': '' if jl_age is None else f'{jl_age:.6f}',
             'publish_joint_age_right_sec': '' if jr_age is None else f'{jr_age:.6f}',
-            'policy_gripper_input_mode': active_chunk.get('policy_gripper_input', {}).get('mode', 'measured'),
-            'left_gripper_request_measured': f'{float(active_chunk.get("request_measured_left", active_chunk["request_current_left"])[-1]):.6f}',
-            'left_gripper_request_policy': f'{float(active_chunk["request_current_left"][-1]):.6f}',
-            'left_gripper_request_commanded': '' if active_chunk.get('policy_gripper_input', {}).get('left_commanded') is None else f'{float(active_chunk.get("policy_gripper_input", {}).get("left_commanded")):.6f}',
-            'right_gripper_request_measured': f'{float(active_chunk.get("request_measured_right", active_chunk["request_current_right"])[-1]):.6f}',
-            'right_gripper_request_policy': f'{float(active_chunk["request_current_right"][-1]):.6f}',
-            'right_gripper_request_commanded': '' if active_chunk.get('policy_gripper_input', {}).get('right_commanded') is None else f'{float(active_chunk.get("policy_gripper_input", {}).get("right_commanded")):.6f}',
-            'left_gripper_publish': f'{float(publish_current_left[-1]):.6f}',
-            'left_gripper_raw': f'{float(raw_target_left[-1]):.6f}',
-            'left_gripper_ensembled': f'{float(ensembled_target_left[-1]):.6f}',
-            'left_gripper_target': f'{float(target_left[-1]):.6f}',
-            'right_gripper_publish': f'{float(publish_current_right[-1]):.6f}',
-            'right_gripper_raw': f'{float(raw_target_right[-1]):.6f}',
-            'right_gripper_ensembled': f'{float(ensembled_target_right[-1]):.6f}',
-            'right_gripper_target': f'{float(target_right[-1]):.6f}',
-            'gripper_hysteresis': json.dumps(gripper_transition),
+            'policy_gripper_input_mode': gripper_input.get('mode', 'measured'),
+            'gripper_hysteresis': json.dumps(shaped['gripper_transition']),
             'base_vel': vector_to_json(base_vel),
-        })
+        }
+        for index, side in enumerate(('left', 'right')):
+            ik = (ik_left, ik_right)[index]
+            commanded = gripper_input.get(f'{side}_commanded')
+            row.update({
+                f'current_{side}': vector_to_json(chunk[f'request_current_{side}']),
+                f'request_measured_{side}': vector_to_json(request_measured[index]),
+                f'publish_current_{side}': vector_to_json(publish_current[index]),
+                f'clip_reference_{side}': vector_to_json(clip_reference[index]),
+                f'command_{side}_before': vector_to_json(command_before[index]),
+                f'raw_{side}': vector_to_json(raw[index]),
+                f'ensembled_{side}': vector_to_json(ensembled[index]),
+                f'filtered_{side}': vector_to_json(filtered[index]),
+                f'target_{side}': vector_to_json(target[index]),
+                f'ik_diagnostics_{side}': '' if ik is None else json.dumps(
+                    {k: v for k, v in ik.items() if k != 'joints'}, separators=(',', ':')),
+                f'ik_joint_{side}': vector_to_json(None if ik is None else ik['joints']),
+                f'ik_{side}_position_error_m': '' if ik is None else f"{ik['position_error_m']:.6f}",
+                f'ik_{side}_orientation_error_rad': '' if ik is None else f"{ik['orientation_error_rad']:.6f}",
+                f'command_delta_deadband_residual_{side}': vector_to_json(residual[index]),
+                f'raw_vs_publish_norm_{side}': norm_first_six(raw[index] - publish_current[index]),
+                f'ensembled_vs_publish_norm_{side}': norm_first_six(ensembled[index] - publish_current[index]),
+                f'target_vs_publish_norm_{side}': norm_first_six(target[index] - publish_current[index]),
+                f'command_delta_deadband_residual_norm_{side}': norm_first_six(residual[index]),
+                f'{side}_gripper_request_measured': fmt(request_measured[index][-1]),
+                f'{side}_gripper_request_policy': fmt(chunk[f'request_current_{side}'][-1]),
+                f'{side}_gripper_request_commanded': '' if commanded is None else fmt(commanded),
+                f'{side}_gripper_publish': fmt(publish_current[index][-1]),
+                f'{side}_gripper_raw': fmt(raw[index][-1]),
+                f'{side}_gripper_ensembled': fmt(ensembled[index][-1]),
+                f'{side}_gripper_target': fmt(target[index][-1]),
+            })
+            for name, pair in deltas.items():
+                row[f'{name}_{side}'] = vector_to_json(pair[index])
+                row[f'{name}_norm_{side}'] = norm_first_six(pair[index])
+        write_action_log(self.action_logger, row)
 
-        active_chunk['executed_steps'] += 1
-        global_action_step += 1
-        chunk_history = [
-            chunk for chunk in chunk_history
-            if global_action_step < chunk['start_step'] + chunk_live_steps(chunk)
-        ][-temporal_max_history_chunks:]
-        return True
+    # --- main loop ------------------------------------------------------------
 
-    try:
-        while not rospy.is_shutdown():
-            if not enable_state:
+    def run(self):
+        self.setup_ros()
+        if not self.move_home():
+            return
+        self.client = AsyncPolicyClient.from_config(self.cfg, self.rate_hz, self.log)
+        self.log.info(
+            f"Policy server endpoint set to {self.client.connect_addr} "
+            f"using ZMQ {self.client.socket_type.upper()}")
+        self.action_logger, self.action_log_path = make_action_logger(self.cfg, self.rate_hz)
+        if self.action_logger is not None and self.ik is not None:
+            self.ik.rejection_log_path = self.action_logger['path'] + '.rejected.jsonl'
+        self.rollout_logger = make_rollout_dataset_logger(self.cfg, self.rate_hz)
+        self.log.info(
+            "Async policy loop enabled: "
+            f"request_check_period={1.0 / self.rate_hz:.3f}s; "
+            "continuing to publish available chunk actions while waiting for policy responses; "
+            "policy requests are checked on each global step and wait for fresh front/left/right images; "
+            f"when_live_chunk={self.request_gate.when_live_chunk}; "
+            f"initial_action_skip_steps={self.scheduler.initial_action_skip_steps}; "
+            f"chunk_action_skip_steps={self.pipeline.chunk_action_skip_steps}; "
+            f"policy_gripper_input_mode={self.gripper_input.mode}."
+        )
+        rate = rospy.Rate(self.rate_hz)
+        try:
+            while not rospy.is_shutdown():
+                self.spin_once()
                 rate.sleep()
-                continue
+        except (KeyboardInterrupt, rospy.ROSInterruptException):
+            self.log.info("cobotmagic_policy_bridge_node interrupted, shutting down.")
+        finally:
+            self.shutdown()
 
-            has_obs = have_obs(use_base=use_base, require_eef=eef_action_mode)
-            has_live_chunk = bool(live_chunks_for_step(global_action_step))
-            if not has_obs and not has_live_chunk and pending_request is None:
-                now = time.monotonic()
-                if now - last_obs_wait_warn >= 2.0:
-                    missing = missing_obs_keys(use_base=use_base, require_eef=eef_action_mode)
-                    rospy.logwarn(f"Waiting for observations: missing={missing}")
-                    last_obs_wait_warn = now
-                rate.sleep()
-                continue
+    def spin_once(self):
+        """One control step: receive replies, maybe request, publish one action."""
+        if not enable_state:
+            return
+        has_obs = have_obs(use_base=self.use_base, require_eef=self.eef_action_mode)
+        if not has_obs and not self.scheduler.live_chunks() and not self.client.busy:
+            now = time.monotonic()
+            if now - self.last_obs_wait_warn >= 2.0:
+                missing = missing_obs_keys(use_base=self.use_base, require_eef=self.eef_action_mode)
+                self.log.warn(f"Waiting for observations: missing={missing}")
+                self.last_obs_wait_warn = now
+            return
 
-            if command_left is None or command_right is None:
-                pkt = snapshot(task_prompt, use_base=use_base, include_eef=eef_action_mode) if has_obs else None
-                if pkt is None:
-                    rate.sleep()
-                    continue
-                if eef_action_mode:
-                    command_left = np.array(pkt['current_eef_left'], dtype=np.float32)
-                    command_right = np.array(pkt['current_eef_right'], dtype=np.float32)
-                else:
-                    command_left = np.array(pkt['jleft'], dtype=np.float32)
-                    command_right = np.array(pkt['jright'], dtype=np.float32)
-                integrated_left = command_left.copy()
-                integrated_right = command_right.copy()
+        if self.command_left is None or self.command_right is None:
+            pkt = snapshot(self.task_prompt, use_base=self.use_base, include_eef=self.eef_action_mode) if has_obs else None
+            if pkt is None:
+                return
+            if self.eef_action_mode:
+                self.command_left = np.array(pkt['current_eef_left'], dtype=np.float32)
+                self.command_right = np.array(pkt['current_eef_right'], dtype=np.float32)
+            else:
+                self.command_left = np.array(pkt['jleft'], dtype=np.float32)
+                self.command_right = np.array(pkt['jright'], dtype=np.float32)
+            self.integrator.reset(self.command_left, self.command_right)
 
-            if pending_request is not None:
-                try:
-                    rep_frames = sock.recv_multipart(flags=zmq.NOBLOCK)
-                except zmq.error.Again:
-                    rep_frames = None
-                    now = time.monotonic()
-                    elapsed = now - pending_request['time']
-                    if elapsed >= 2.0 and now - last_response_wait_warn >= 2.0:
-                        rospy.logwarn(
-                            f"Waiting for policy server response from {connect_addr}. "
-                            "Continuing with available chunk actions."
-                        )
-                        last_response_wait_warn = now
-                    if elapsed >= max(policy_response_timeout_sec, 0.1):
-                        rospy.logwarn(
-                            f"Policy server response timed out after {policy_response_timeout_sec:.1f}s; "
-                            "recreating ZeroMQ socket and keeping any available chunk actions."
-                        )
-                        sock.close(0)
-                        sock = make_policy_socket(ctx, connect_addr, recv_timeout_ms, socket_type)
-                        pending_request = None
-                if rep_frames:
-                    pending_snapshot = pending_request
-                    pending_request = None
-                    ingest_policy_response(rep_frames, pending_snapshot)
+        reply = self.client.poll()
+        if reply is not None:
+            self.ingest_policy_response(*reply)
+        if not self.client.busy and has_obs:
+            self.maybe_send_request()
 
-            if pending_request is None and has_obs:
-                pkt = snapshot(task_prompt, use_base=use_base, include_eef=eef_action_mode)
-                if pkt is not None:
-                    fresh_enough, stale_obs = obs_is_fresh_enough(pkt)
-                    if not fresh_enough:
-                        now = time.monotonic()
-                        if now - last_stale_obs_warn >= 1.0:
-                            formatted = [
-                                f"{key}={age:.3f}s" if age is not None else f"{key}=None"
-                                for key, age in stale_obs
-                            ]
-                            rospy.logwarn(
-                                "Delaying policy request because observations are stale: "
-                                f"{formatted}"
-                            )
-                            last_stale_obs_warn = now
-                    else:
-                        camera_seq = tuple(pkt['obs_seq'][key] for key in CAMERA_KEYS)
-                        if last_request_camera_seq is None:
-                            fresh_flags = (True, True, True)
-                        else:
-                            fresh_flags = tuple(
-                                seq > last
-                                for seq, last in zip(camera_seq, last_request_camera_seq)
-                            )
-                        fresh_camera_count = sum(1 for is_fresh in fresh_flags if is_fresh)
-                        fresh_camera_set = fresh_camera_count == 3
-                        live_chunks = live_chunks_for_step(global_action_step)
-                        remaining_steps = 0
-                        if live_chunks:
-                            active_for_budget = live_chunks[-1]
-                            remaining_steps = (
-                                active_for_budget['start_step']
-                                + chunk_live_steps(active_for_budget)
-                                - global_action_step
-                            )
-                        should_wait_for_chunk = (
-                            policy_request_when_live_chunk == 'wait'
-                            and bool(live_chunks)
-                        )
-                        force_fresh_fallback = (
-                            not should_wait_for_chunk
-                            and last_request_camera_seq is not None
-                            and fresh_camera_count > 0
-                            and (not live_chunks or remaining_steps <= max(6, latency_fixed_steps))
-                        )
-                        if should_wait_for_chunk:
-                            now = time.monotonic()
-                            if now - last_stale_obs_warn >= 2.0:
-                                rospy.loginfo(
-                                    "Delaying policy request until current chunk is fully consumed: "
-                                    f"remaining_steps={remaining_steps}"
-                                )
-                                last_stale_obs_warn = now
-                        elif fresh_camera_set:
-                            send_policy_request(pkt, fresh_camera_count, forced_fresh_fallback=False)
-                        elif force_fresh_fallback:
-                            send_policy_request(pkt, fresh_camera_count, forced_fresh_fallback=True)
-                        else:
-                            now = time.monotonic()
-                            if now - last_stale_obs_warn >= 2.0:
-                                rospy.loginfo(
-                                    "Delaying policy request until all camera images refresh: "
-                                    f"last={last_request_camera_seq} current={camera_seq} "
-                                    f"fresh={fresh_camera_count}/3 remaining_steps={remaining_steps}"
-                                )
-                                last_stale_obs_warn = now
+        chunk = self.scheduler.select_chunk()
+        if chunk is not None:
+            self.publish_step(chunk)
 
-            live_chunks = live_chunks_for_step(global_action_step)
-            if live_chunks:
-                active_chunk = select_chunk_for_step(global_action_step)
-                if active_chunk is not None:
-                    publish_action_from_chunk(active_chunk)
+    def shutdown(self):
+        run_shutdown_safety(self.pub_l, self.pub_r, self.pub_v, self.enable_pub, self.name_list, self.cfg)
+        if self.action_logger is not None:
+            self.action_logger['file'].flush()
+            self.action_logger['file'].close()
+            self.log.info(f"Action command log saved: {self.action_log_path}")
+        if self.rollout_logger is not None and self.rollout_logger.get('h5_file') is not None:
+            self.rollout_logger['h5_file'].flush()
+            self.rollout_logger['h5_file'].close()
+            self.log.info(f"Rollout HDF5 saved: {self.rollout_logger.get('h5_path')}")
+        self.client.close()
 
-            rate.sleep()
 
-    except (KeyboardInterrupt, rospy.ROSInterruptException):
-        rospy.loginfo("cobotmagic_policy_bridge_node interrupted, shutting down.")
-    finally:
-        run_shutdown_safety(pub_l, pub_r, pub_v, enable_pub, name_list, cfg)
-        if action_logger is not None:
-            action_logger['file'].flush()
-            action_logger['file'].close()
-            rospy.loginfo(f"Action command log saved: {action_log_path}")
-        if rollout_logger is not None and rollout_logger.get('h5_file') is not None:
-            rollout_logger['h5_file'].flush()
-            rollout_logger['h5_file'].close()
-            rospy.loginfo(f"Rollout HDF5 saved: {rollout_logger.get('h5_path')}")
-        sock.close(0)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--config', required=True, help='path to a backend-specific YAML config')
+    args = ap.parse_args()
+    with open(args.config, 'r', encoding='utf-8') as f:
+        cfg = yaml.safe_load(f)
+    rospy.init_node('cobotmagic_policy_bridge_node')
+    DualArmPolicyBridge(cfg).run()
+
 
 if __name__ == '__main__':
     main()

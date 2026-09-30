@@ -265,14 +265,80 @@ python -m cobotmagic_deployment.servers.policy_server_xvla_agilex \
 | `cobotmagic_deployment/bridges/` | ROS–ZeroMQブリッジ（`action_logging.py` はログ・データセット出力） |
 | `cobotmagic_deployment/servers/` | バックエンド別ポリシーサーバー |
 | `cobotmagic_deployment/policies/` | モデル固有のポリシーラッパー |
-| `cobotmagic_deployment/common/` | 共通モジュール。`policy_server_protocol.py`（通信）、`action_processing.py`（ROS非依存のチャンク加工）、Piper IK、OpenWAM変換、グリッパーヒステリシス、DreamZeroノイズ適応 |
+| `cobotmagic_deployment/common/` | ROS非依存の共通モジュール（[7章](#7-新しいポリシーモデルの追加)の表を参照） |
 | `cobotmagic_deployment/configs/` | ROS、通信、アクション、モデル固有のYAML設定 |
 | `cobotmagic_deployment/tools/` | smoke testとモデル検証ツール |
 | `scripts/` | OpenWAM環境構築・起動スクリプトとログ再生・解析スクリプト |
-| `tests/` | IK、OpenWAM変換、グリッパー処理、DreamZeroノイズ適応のテスト |
+| `tests/` | ブリッジ部品、サーバー実行基盤、通信、IK、OpenWAM変換、グリッパー処理、DreamZeroノイズ適応のテスト |
 | `docs/openwam/` | OpenWAMデプロイ手順と調整・診断記録 |
 | `realsense_bridge/` | 旧版の簡易OpenPIブリッジ（同期型・関節速度アクション）。サンプル設定は1台のRealSenseを3カメラ分に流用 |
 | `aloha.yml` | ROSブリッジ用Conda環境 |
+
+## 7. 新しいポリシーモデルの追加
+
+ブリッジとサーバーの機能は部品として分かれており、新しいモデルは既存の機能を設定やimportで
+そのまま使えます。
+
+### 7.1 手順
+
+1. `servers/policy_server_template.py` を `servers/policy_server_<model>.py` に、
+   `configs/config_template.yaml` を `configs/config_<model>.yaml` にコピーします。
+2. YAMLの `policy_backend` とモデルセクション名を `<model>` に変え、サーバーの
+   `load_server_config(..., "<model>", ...)` と合わせます。
+3. `predict(header, images)` にモデル推論を書きます。戻り値は `(T, 14)`（左腕7次元＋右腕7次元）で、
+   `action_mode` はブリッジの `ros.action_mode` と同じにします。
+   - `absolute`: 関節目標値
+   - `eef_absolute`: 各腕 `[x, y, z, roll, pitch, yaw, gripper]`。関節指令への変換はブリッジ側のIK（`eef_ik`）
+   - 台車速度も返す場合は `(actions, vel)` を返します。
+4. ブリッジはコード変更不要です。YAMLの `ros` セクションで、非同期推論、チャンクの補間・フィルタ、
+   ステップごとの加工、グリッパー処理、微分IKなどを `enabled: true` で選びます
+   （[付録B](#付録b-ブリッジのyamlオプション)）。
+
+```bash
+# モデルなしで起動確認（現在状態をそのまま返す）
+python -m cobotmagic_deployment.servers.policy_server_template --mock --startup-test
+python -m cobotmagic_deployment.servers.policy_server_template --inference-test
+```
+
+サーバー実行基盤（`common/policy_server_runtime.py`）が、設定読み込み、`--config`/`--bind`/`--mock`/
+`--startup-test`/`--inference-test`、ウォームアップ、リクエストループ、エラー時の空応答を提供します。
+X-VLAサーバーはこの基盤の `run_server` をそのまま使い、OpenPIとOpenWAMはリクエストループ（`serve`）を使っています。
+DreamZeroは複数GPU（torchrun）とプロンプト操作用ソケットのため独自ループです。
+
+### 7.2 共通モジュール
+
+`cobotmagic_deployment/common/` のブリッジ部品はROSに依存しないため、別のブリッジやサーバー、
+オフライン検証からも直接importできます。標準ブリッジ（`DualArmPolicyBridge`）はこれらを組み合わせたものです。
+
+| モジュール | 主なクラス・関数 | 役割 | 対応するYAML |
+| --- | --- | --- | --- |
+| `policy_client.py` | `AsyncPolicyClient` | ノンブロッキングのZeroMQ送受信、応答タイムアウト時の再接続 | `zmq.*`、`policy_response_timeout_sec` |
+| `chunk_scheduler.py` | `ChunkScheduler`、`PolicyRequestGate` | 非同期推論のタイムライン（実行中チャンク、時間アンサンブル、遅延補償）とリクエスト送信判定 | `temporal_ensemble`、`policy_request`、`initial_action_skip_steps` |
+| `chunk_pipeline.py` | `ChunkPipeline`、`parse_action_response` | 応答の解析と、受信時のチャンク加工（ローパス、単調化、平滑化、補間、終点フィルタ） | `action_chunk_*`、`chunk_interpolation`、`chunk_terminal_displacement_filter`、`open_loop_steps` |
+| `command_shaper.py` | `CommandShaper`、`PolicyGripperInput`、`VelocityIntegrator` | ステップごとの指令整形とグリッパー処理、ポリシーへ送るグリッパー値、速度の積分 | `action_filter`、`delta_clip`、`gripper_*`、`command_delta_deadband`、`first_action_delta_scale`、`initial_pose_delta_override`、`policy_gripper_input` |
+| `ik_commander.py` | `EefIkCommander` | EEF目標から関節指令へのIK（微分IK含む）、棄却判定、手首特異点ガードのホールド | `eef_ik` |
+| `command_publisher.py` | `InterpolatedCommandPublisher` | 制御周期間を線形補間する高レートpublishスレッド | `command_publish` |
+| `action_processing.py` | 各種関数 | 上記部品が使うNumPyの数値処理（フィルタ、補間、アンサンブル、姿勢変換） | — |
+| `piper_ik.py`、`piper_differential_ik.py` | `PiperNumericalIK`、`DifferentialIK` | Piperの数値IKと微分IK | `eef_ik` |
+| `gripper_hysteresis.py` | `GripperHysteresis` | グリッパーの2値化（不感帯と連続確認） | `gripper_hysteresis` |
+| `policy_server_protocol.py` | `recv_packet`、`send_actions` など | ブリッジとサーバー間の通信形式 | — |
+| `policy_server_runtime.py` | `run_server`、`serve`、`EchoStatePolicy` など | ポリシーサーバーの共通実行基盤 | — |
+| `bridge_log.py` | `BridgeLog` | 部品共通のログ出力（ROSでも標準loggingでも利用可） | — |
+
+たとえば、別のロボット用ブリッジで補間と微分IKだけを使う場合は次のようになります。
+
+```python
+from cobotmagic_deployment.common.chunk_pipeline import ChunkPipeline
+from cobotmagic_deployment.common.ik_commander import EefIkCommander
+
+pipeline = ChunkPipeline(cfg['ros'], rate_hz)
+chunk = pipeline.process(left, right, None, command_left, command_right, measured_left, measured_right)
+ik = EefIkCommander(cfg['ros']['eef_ik'], rate_hz)
+results = ik.solve(target_left, target_right, joints_left, joints_right, command_left, command_right)
+if results is not None:
+    publish(results['left']['joints'], results['right']['joints'])
+    ik.commit(results)
+```
 
 ## 付録A: 対応ポリシー
 
@@ -366,6 +432,7 @@ OpenVLAのポリシーサーバーは、OpenVLA-OFT側の手順に従って起�
 | サーバー | オプション |
 | --- | --- |
 | `policy_server_openpi` | `--config`、`--bind` |
+| `policy_server_template` | `--config`、`--bind`、`--mock`、`--startup-test`、`--inference-test`（新モデル用の雛形） |
 | `policy_server_xvla_agilex` | `--config`、`--bind`、`--mock`（重みを読まず現在姿勢を返す）、`--startup-test`（bindして終了）、`--inference-test`（ダミー推論1回）、`--local-files-only` |
 | `policy_server_dreamzero_agilex` | `--config`、`--bind`、`--startup-test`、`--inference-test`、`--benchmark-runs N`、`--warmup`、`--flash`/`--no-flash`（DiTキャッシュ、既定有効）、`--num-dit-steps`、`--timeout-seconds`、プロンプト操作（`--set-task-prompt`、`--get-task-prompt`、`--clear-task-prompt`、`--prompt-control-bind`、`--prompt-control-connect`、`--prompt-control-timeout-ms`） |
 | `policy_server_openwam_piper` | `--config`、`--bind`、`--mock`（重みを読まず現在EEF姿勢を返す）、`--startup-test`（ソケットを開かずに1回推論して終了）、`--denoise-steps` |
@@ -378,7 +445,7 @@ OpenPIの学習、正規化統計、データ変換は外部リポジトリで�
 
 ## 注意
 
-- `policy_server_protocol.py` は共通通信実装であり、直接起動しません。
+- `common/` のモジュール（`policy_server_protocol.py` など）はライブラリであり、直接起動しません。
 - ROS用Python環境とモデル用Python環境は分離してください。
 - YAML内の絶対パス、GPU番号、ROS topic、初期姿勢は実行環境に合わせて確認してください。
 

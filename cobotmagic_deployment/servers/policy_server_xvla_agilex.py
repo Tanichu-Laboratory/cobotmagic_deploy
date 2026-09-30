@@ -15,8 +15,9 @@ os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
-import yaml
-from cobotmagic_deployment.common.policy_server_protocol import bind_server, recv_packet, send_actions, send_empty
+from cobotmagic_deployment.common.policy_server_runtime import (
+    CONFIG_DIR, add_server_arguments, load_server_config, run_server,
+)
 
 
 IDENTITY_ROT6D = np.asarray([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
@@ -73,22 +74,6 @@ def request_proprio20(header: dict[str, Any]) -> np.ndarray:
     proprio[13:19] = IDENTITY_ROT6D
     proprio[19] = jright[6]
     return proprio
-
-
-class MockXVLAPolicy:
-    def __init__(self, chunk_size: int = 30) -> None:
-        self.chunk_size = chunk_size
-
-    def predict(self, header: dict[str, Any], _imgs: dict[str, np.ndarray]) -> np.ndarray:
-        if header.get("current_eef_left") is not None and header.get("current_eef_right") is not None:
-            left = np.asarray(header["current_eef_left"], dtype=np.float32)
-            right = np.asarray(header["current_eef_right"], dtype=np.float32)
-            current = np.concatenate([left[:7], right[:7]], axis=0)
-        else:
-            jleft = np.asarray(header["jleft"], dtype=np.float32)
-            jright = np.asarray(header["jright"], dtype=np.float32)
-            current = np.concatenate([jleft[:7], jright[:7]], axis=0)
-        return np.repeat(current[None, :], self.chunk_size, axis=0).astype(np.float32)
 
 
 class XVLAAgilexPolicy:
@@ -165,7 +150,8 @@ class XVLAAgilexPolicy:
         )
         return ee6d20_to_action14(action20)
 
-    def warmup(self, cfg: dict[str, Any], task_prompt: str) -> None:
+    def warmup(self, cfg: dict[str, Any]) -> None:
+        task_prompt = str(cfg["task_prompt"])
         image_hw = cfg.get("warmup_image_hw", [480, 640])
         height, width = int(image_hw[0]), int(image_hw[1])
         dummy = np.zeros((height, width, 3), dtype=np.uint8)
@@ -184,20 +170,7 @@ class XVLAAgilexPolicy:
 
 
 def load_config(path: Path) -> dict[str, Any]:
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    backend = str(raw.get("policy_backend", "xvla")).lower()
-    if backend != "xvla":
-        raise ValueError(f"Unsupported policy_backend={backend!r}; expected xvla")
-    section = "xvla"
-    if section not in raw:
-        raise KeyError(f"{path} does not contain a {section!r} section")
-    cfg = dict(raw[section])
-    cfg["backend"] = backend
-    cfg["task_prompt"] = raw.get("task_prompt", "demo-task")
-    cfg["server_bind"] = raw.get("zmq", {}).get("server_bind", "tcp://127.0.0.1:5555")
-    cfg["socket_type"] = raw.get("zmq", {}).get("socket_type", "req")
-    return cfg
-
+    return load_server_config(path, "xvla", backends=("xvla",))
 
 
 def test_header(task_prompt: str) -> dict[str, Any]:
@@ -217,49 +190,8 @@ def test_header(task_prompt: str) -> dict[str, Any]:
     }
 
 
-def print_action_stats(label: str, actions14: np.ndarray) -> None:
-    actions14 = np.asarray(actions14, dtype=np.float32)
-    print(
-        f"[{label}] inference action_shape={actions14.shape} finite={bool(np.isfinite(actions14).all())} "
-        f"min={float(np.nanmin(actions14)):.6f} max={float(np.nanmax(actions14)):.6f} "
-        f"mean={float(np.nanmean(actions14)):.6f} std={float(np.nanstd(actions14)):.6f}",
-        flush=True,
-    )
-    names = ["left", "right"]
-    for arm, sl in zip(names, (slice(0, 7), slice(7, 14))):
-        arr = actions14[:, sl]
-        print(
-            f"[{label}] {arm} xyz_min={np.nanmin(arr[:, :3], axis=0).round(6).tolist()} "
-            f"xyz_max={np.nanmax(arr[:, :3], axis=0).round(6).tolist()} "
-            f"rpy_min={np.nanmin(arr[:, 3:6], axis=0).round(6).tolist()} "
-            f"rpy_max={np.nanmax(arr[:, 3:6], axis=0).round(6).tolist()} "
-            f"gripper_min={float(np.nanmin(arr[:, 6])):.6f} gripper_max={float(np.nanmax(arr[:, 6])):.6f}",
-            flush=True,
-        )
-    print(f"[{label}] first={actions14[0].round(6).tolist()}", flush=True)
-    print(f"[{label}] last={actions14[-1].round(6).tolist()}", flush=True)
-
-
-def run_inference_test(policy: Any, cfg: dict[str, Any]) -> None:
-    image_hw = cfg.get("warmup_image_hw", [480, 640])
-    height, width = int(image_hw[0]), int(image_hw[1])
-    dummy = np.zeros((height, width, 3), dtype=np.uint8)
-    header = test_header(str(cfg["task_prompt"]))
-    started = time.perf_counter()
-    actions14 = policy.predict(header, {"front": dummy, "left": dummy, "right": dummy})
-    elapsed = time.perf_counter() - started
-    label = str(cfg.get("backend", "policy"))
-    print_action_stats(label, actions14)
-    print(f"[{label}] inference elapsed={elapsed:.3f}s", flush=True)
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=Path(__file__).resolve().parents[1] / "configs" / "config_xvla_agilex.yaml")
-    parser.add_argument("--bind", default="", help="Override zmq.server_bind from config YAML")
-    parser.add_argument("--mock", action="store_true", help="Start protocol-compatible server without loading X-VLA")
-    parser.add_argument("--startup-test", action="store_true", help="Bind the socket, print readiness, and exit")
-    parser.add_argument("--inference-test", action="store_true", help="Run one dummy inference, print value ranges, and exit")
+    parser = add_server_arguments(argparse.ArgumentParser(), CONFIG_DIR / "config_xvla_agilex.yaml")
     parser.add_argument("--local-files-only", action="store_true", help="Do not download model files from Hugging Face")
     return parser.parse_args()
 
@@ -267,61 +199,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cfg = load_config(Path(args.config).expanduser().resolve())
-    if args.bind:
-        cfg["server_bind"] = args.bind
     if args.local_files_only:
         cfg["local_files_only"] = True
-
-    backend = str(cfg.get("backend", "xvla"))
-    if args.mock:
-        policy: Any = MockXVLAPolicy(chunk_size=int(cfg.get("chunk_size", 30)))
-        print(f"[{backend}] mock policy enabled; model weights are not loaded", flush=True)
-    else:
-        policy = XVLAAgilexPolicy(cfg)
-        if bool(cfg.get("warmup", False)):
-            policy.warmup(cfg, str(cfg["task_prompt"]))
-
-    if args.inference_test:
-        run_inference_test(policy, cfg)
-        return
-
-    sock, server_kind_name = bind_server(str(cfg["server_bind"]), str(cfg["socket_type"]))
-    print(
-        f"[{cfg.get('backend', 'xvla')}] CobotMagic server bind {cfg['server_bind']} "
-        f"using ZMQ {server_kind_name} ({cfg['socket_type']} protocol)",
-        flush=True,
-    )
-
-    if args.startup_test:
-        sock.close(0)
-        print(f"[{cfg.get('backend', 'xvla')}] startup test passed", flush=True)
-        return
-
-    while True:
-        try:
-            print(f"[{cfg.get('backend', 'xvla')}] waiting for request", flush=True)
-            header, imgs = recv_packet(sock)
-            started = time.perf_counter()
-            control_hz = float(header.get("control_hz", 20.0))
-            print(
-                f"[{cfg.get('backend', 'xvla')}] request received task={header.get('task_prompt', 'demo-task')!r} "
-                f"control_hz={control_hz}",
-                flush=True,
-            )
-            actions14 = policy.predict(header, imgs)
-            send_actions(sock, actions14, control_hz=control_hz, action_mode="eef_absolute")
-            print(
-                f"[{cfg.get('backend', 'xvla')}] response sent action_shape={actions14.shape} "
-                f"elapsed={time.perf_counter() - started:.3f}s",
-                flush=True,
-            )
-        except KeyboardInterrupt:
-            break
-        except Exception as exc:  # noqa: BLE001
-            print(f"[{cfg.get('backend', 'xvla')}] request error: {exc}", flush=True)
-            send_empty(sock, str(exc), action_mode="eef_absolute")
-
-    sock.close(0)
+    run_server(args, cfg, XVLAAgilexPolicy, name=str(cfg["backend"]), action_mode="eef_absolute",
+               test_header=test_header)
 
 
 if __name__ == "__main__":
